@@ -8,10 +8,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"eth2-exporter/config"
 	"eth2-exporter/price"
 	"eth2-exporter/types"
 	"fmt"
 	"html/template"
+	"image/color"
 	"io/ioutil"
 	"log"
 	"math"
@@ -29,12 +31,15 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 
+	"github.com/ethereum/go-ethereum/accounts/abi"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/kataras/i18n"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/lib/pq"
 	"github.com/sirupsen/logrus"
+	"github.com/skip2/go-qrcode"
 )
 
 // Config is the globally accessible configuration
@@ -54,12 +59,16 @@ func getLocaliser() *i18n.I18n {
 	return localiser
 }
 
+var HashLikeRegex = regexp.MustCompile(`^[0-9a-fA-F]{0,96}$`)
+
 // GetTemplateFuncs will get the template functions
 func GetTemplateFuncs() template.FuncMap {
 	return template.FuncMap{
 		"includeHTML":                             IncludeHTML,
 		"formatHTML":                              FormatMessageToHtml,
 		"formatBalance":                           FormatBalance,
+		"formatBalanceChange":                     FormatBalanceChange,
+		"formatNotificationChannel":               FormatNotificationChannel,
 		"formatBalanceSql":                        FormatBalanceSql,
 		"formatCurrentBalance":                    FormatCurrentBalance,
 		"formatEffectiveBalance":                  FormatEffectiveBalance,
@@ -68,17 +77,21 @@ func GetTemplateFuncs() template.FuncMap {
 		"formatSlotToTimestamp":                   FormatSlotToTimestamp,
 		"formatDepositAmount":                     FormatDepositAmount,
 		"formatEpoch":                             FormatEpoch,
+		"formatAddressLong":                       FormatAddressLong,
+		"formatHashLong":                          FormatHashLong,
 		"formatEth1Block":                         FormatEth1Block,
+		"formatEth1BlockHash":                     FormatEth1BlockHash,
 		"formatEth1Address":                       FormatEth1Address,
 		"formatEth1AddressStringLowerCase":        FormatEth1AddressStringLowerCase,
 		"formatEth1TxHash":                        FormatEth1TxHash,
 		"formatGraffiti":                          FormatGraffiti,
 		"formatHash":                              FormatHash,
+		"formatWithdawalCredentials":              FormatWithdawalCredentials,
+		"formatBitvector":                         FormatBitvector,
 		"formatBitlist":                           FormatBitlist,
 		"formatBitvectorValidators":               formatBitvectorValidators,
 		"formatParticipation":                     FormatParticipation,
 		"formatIncome":                            FormatIncome,
-		"formatMoney":                             FormatMoney,
 		"formatIncomeSql":                         FormatIncomeSql,
 		"formatSqlInt64":                          FormatSqlInt64,
 		"formatValidator":                         FormatValidator,
@@ -96,24 +109,36 @@ func GetTemplateFuncs() template.FuncMap {
 		"formatTimestamp":                         FormatTimestamp,
 		"formatTsWithoutTooltip":                  FormatTsWithoutTooltip,
 		"formatTimestampTs":                       FormatTimestampTs,
+		"formatTime":                              FormatTime,
 		"formatValidatorName":                     FormatValidatorName,
 		"formatAttestationInclusionEffectiveness": FormatAttestationInclusionEffectiveness,
 		"formatValidatorTags":                     FormatValidatorTags,
 		"formatValidatorTag":                      FormatValidatorTag,
 		"formatRPL":                               FormatRPL,
-		"formatFloatWithPrecision":                FormatFloatWithPrecision,
+		"formatETH":                               FormatETH,
+		"formatFloat":                             FormatFloat,
+		"formatAmount":                            FormatAmount,
+		"formatYesNo":                             FormatYesNo,
+		"formatAmountFormatted":                   FormatAmountFormated,
+		"formatAddressAsLink":                     FormatAddressAsLink,
+		"formatBuilder":                           FormatBuilder,
+		"formatDifficulty":                        FormatDifficulty,
 		"epochOfSlot":                             EpochOfSlot,
 		"dayToTime":                               DayToTime,
 		"contains":                                strings.Contains,
 		"roundDecimals":                           RoundDecimals,
+		"bigIntCmp":                               func(i *big.Int, j int) int { return i.Cmp(big.NewInt(int64(j))) },
 		"mod":                                     func(i, j int) bool { return i%j == 0 },
 		"sub":                                     func(i, j int) int { return i - j },
+		"subUI64":                                 func(i, j uint64) uint64 { return i - j },
 		"add":                                     func(i, j int) int { return i + j },
 		"addI64":                                  func(i, j int64) int64 { return i + j },
+		"addUI64":                                 func(i, j uint64) uint64 { return i + j },
 		"mul":                                     func(i, j float64) float64 { return i * j },
 		"div":                                     func(i, j float64) float64 { return i / j },
 		"divInt":                                  func(i, j int) float64 { return float64(i) / float64(j) },
 		"gtf":                                     func(i, j float64) bool { return i > j },
+		"ltf":                                     func(i, j float64) bool { return i < j },
 		"round": func(i float64, n int) float64 {
 			return math.Round(i*math.Pow10(n)) / math.Pow10(n)
 		},
@@ -122,13 +147,18 @@ func GetTemplateFuncs() template.FuncMap {
 			p := message.NewPrinter(language.English)
 			return p.Sprintf("%.0f\n", i)
 		},
+		"formatThousandsFancy": func(i float64) string {
+			p := message.NewPrinter(language.English)
+			return p.Sprintf("%v\n", i)
+		},
 		"formatThousandsInt": func(i int) string {
 			p := message.NewPrinter(language.English)
 			return p.Sprintf("%d", i)
 		},
-		"derefString":      DerefString,
-		"trLang":           TrLang,
-		"firstCharToUpper": func(s string) string { return strings.Title(s) },
+		"formatStringThousands": FormatThousandsEnglish,
+		"derefString":           DerefString,
+		"trLang":                TrLang,
+		"firstCharToUpper":      func(s string) string { return strings.Title(s) },
 		"eqsp": func(a, b *string) bool {
 			if a != nil && b != nil {
 				return *a == *b
@@ -137,6 +167,44 @@ func GetTemplateFuncs() template.FuncMap {
 		},
 		"stringsJoin":     strings.Join,
 		"formatAddCommas": FormatAddCommas,
+		"encodeToString":  hex.EncodeToString,
+
+		"formatTokenBalance":      FormatTokenBalance,
+		"formatAddressEthBalance": FormatAddressEthBalance,
+		"toBase64":                ToBase64,
+		"bytesToNumberString": func(input []byte) string {
+			return new(big.Int).SetBytes(input).String()
+		},
+		"bigQuo": func(num []byte, denom []byte) string {
+			numFloat := new(big.Float).SetInt(new(big.Int).SetBytes(num))
+			denomFloat := new(big.Float).SetInt(new(big.Int).SetBytes(denom))
+			res := new(big.Float).Quo(numFloat, denomFloat)
+			return res.Text('f', int(res.MinPrec()))
+		},
+		"bigDecimalShift": func(num []byte, shift []byte) string {
+			numFloat := new(big.Float).SetInt(new(big.Int).SetBytes(num))
+			denom := new(big.Int).Exp(big.NewInt(10), new(big.Int).SetBytes(shift), nil)
+			// shift := new(big.Float).SetInt(new(big.Int).SetBytes(shift))
+			res := new(big.Float).Quo(numFloat, new(big.Float).SetInt(denom))
+			return res.Text('f', int(res.MinPrec()))
+		},
+		"trimTrailingZero": func(num string) string {
+			if strings.Contains(num, ".") {
+				return strings.TrimRight(strings.TrimRight(num, "0"), ".")
+			}
+			return num
+		},
+		// ETH1 related formatting
+		"formatBalanceWei":      FormatBalanceWei,
+		"formatBytesAmount":     FormatBytesAmount,
+		"formatEth1TxStatus":    FormatEth1TxStatus,
+		"formatTimestampUInt64": FormatTimestampUInt64,
+		"formatEth1AddressFull": FormatEth1AddressFull,
+		"byteToString": func(num []byte) string {
+			return string(num)
+		},
+		"formatEthstoreComparison": FormatEthstoreComparison,
+		"formatPoolPerformance":    FormatPoolPerformance,
 	}
 }
 
@@ -169,14 +237,14 @@ func fixUtf(r rune) rune {
 }
 
 func SyncPeriodOfEpoch(epoch uint64) uint64 {
-	if epoch < Config.Chain.AltairForkEpoch {
+	if epoch < Config.Chain.Config.AltairForkEpoch {
 		return 0
 	}
-	return epoch / Config.Chain.EpochsPerSyncCommitteePeriod
+	return epoch / Config.Chain.Config.EpochsPerSyncCommitteePeriod
 }
 
 func FirstEpochOfSyncPeriod(syncPeriod uint64) uint64 {
-	return syncPeriod * Config.Chain.EpochsPerSyncCommitteePeriod
+	return syncPeriod * Config.Chain.Config.EpochsPerSyncCommitteePeriod
 }
 
 func TimeToSyncPeriod(t time.Time) uint64 {
@@ -185,22 +253,22 @@ func TimeToSyncPeriod(t time.Time) uint64 {
 
 // EpochOfSlot returns the corresponding epoch of a slot
 func EpochOfSlot(slot uint64) uint64 {
-	return slot / Config.Chain.SlotsPerEpoch
+	return slot / Config.Chain.Config.SlotsPerEpoch
 }
 
 // DayOfSlot returns the corresponding day of a slot
 func DayOfSlot(slot uint64) uint64 {
-	return Config.Chain.SecondsPerSlot * slot / (24 * 3600)
+	return Config.Chain.Config.SecondsPerSlot * slot / (24 * 3600)
 }
 
 // WeekOfSlot returns the corresponding week of a slot
 func WeekOfSlot(slot uint64) uint64 {
-	return Config.Chain.SecondsPerSlot * slot / (7 * 24 * 3600)
+	return Config.Chain.Config.SecondsPerSlot * slot / (7 * 24 * 3600)
 }
 
 // SlotToTime returns a time.Time to slot
 func SlotToTime(slot uint64) time.Time {
-	return time.Unix(int64(Config.Chain.GenesisTimestamp+slot*Config.Chain.SecondsPerSlot), 0)
+	return time.Unix(int64(Config.Chain.GenesisTimestamp+slot*Config.Chain.Config.SecondsPerSlot), 0)
 }
 
 // TimeToSlot returns time to slot in seconds
@@ -208,12 +276,12 @@ func TimeToSlot(timestamp uint64) uint64 {
 	if Config.Chain.GenesisTimestamp > timestamp {
 		return 0
 	}
-	return (timestamp - Config.Chain.GenesisTimestamp) / Config.Chain.SecondsPerSlot
+	return (timestamp - Config.Chain.GenesisTimestamp) / Config.Chain.Config.SecondsPerSlot
 }
 
 // EpochToTime will return a time.Time for an epoch
 func EpochToTime(epoch uint64) time.Time {
-	return time.Unix(int64(Config.Chain.GenesisTimestamp+epoch*Config.Chain.SecondsPerSlot*Config.Chain.SlotsPerEpoch), 0)
+	return time.Unix(int64(Config.Chain.GenesisTimestamp+epoch*Config.Chain.Config.SecondsPerSlot*Config.Chain.Config.SlotsPerEpoch), 0)
 }
 
 // TimeToDay will return a days since genesis for an timestamp
@@ -231,7 +299,11 @@ func TimeToEpoch(ts time.Time) int64 {
 	if int64(Config.Chain.GenesisTimestamp) > ts.Unix() {
 		return 0
 	}
-	return (ts.Unix() - int64(Config.Chain.GenesisTimestamp)) / int64(Config.Chain.SecondsPerSlot) / int64(Config.Chain.SlotsPerEpoch)
+	return (ts.Unix() - int64(Config.Chain.GenesisTimestamp)) / int64(Config.Chain.Config.SecondsPerSlot) / int64(Config.Chain.Config.SlotsPerEpoch)
+}
+
+func WeiToEther(wei *big.Int) *big.Float {
+	return new(big.Float).Quo(new(big.Float).SetInt(wei), big.NewFloat(params.Ether))
 }
 
 // WaitForCtrlC will block/wait until a control-c is pressed
@@ -243,58 +315,94 @@ func WaitForCtrlC() {
 
 // ReadConfig will process a configuration
 func ReadConfig(cfg *types.Config, path string) error {
-	err := readConfigFile(cfg, path)
 
-	if err != nil {
-		return err
+	if strings.HasPrefix(path, "projects/") {
+		x, err := AccessSecretVersion(path)
+		if err != nil {
+			return fmt.Errorf("error getting config from secret store: %v", err)
+		}
+		err = yaml.Unmarshal([]byte(*x), cfg)
+		if err != nil {
+			return fmt.Errorf("error decoding config file %v: %v", path, err)
+		}
+
+		logger.Infof("seeded config file from secret store")
+	} else {
+
+		err := readConfigFile(cfg, path)
+		if err != nil {
+			return err
+		}
 	}
 
 	readConfigEnv(cfg)
-	err = readConfigSecrets(cfg)
+	err := readConfigSecrets(cfg)
 	if err != nil {
 		return err
 	}
 
-	// decode phase0 config
-	if len(cfg.Chain.Phase0Path) == 0 {
-		cfg.Chain.Phase0Path = "config/phase0.yml"
-	}
-	phase0 := &types.Phase0{}
-	f, err := os.Open(cfg.Chain.Phase0Path)
-	if err != nil {
-		logrus.Errorf("error opening Phase0 Config file %v: %v", cfg.Chain.Phase0Path, err)
-	} else {
-		decoder := yaml.NewDecoder(f)
-		err = decoder.Decode(phase0)
+	if cfg.Chain.ConfigPath == "" {
+		switch cfg.Chain.Name {
+		case "mainnet":
+			err = yaml.Unmarshal([]byte(config.MainnetChainYml), &cfg.Chain.Config)
+		case "prater":
+			err = yaml.Unmarshal([]byte(config.PraterChainYml), &cfg.Chain.Config)
+		case "ropsten":
+			err = yaml.Unmarshal([]byte(config.RopstenChainYml), &cfg.Chain.Config)
+		case "sepolia":
+			err = yaml.Unmarshal([]byte(config.SepoliaChainYml), &cfg.Chain.Config)
+		default:
+			return fmt.Errorf("tried to set known chain-config, but unknown chain-name")
+		}
 		if err != nil {
-			logrus.Errorf("error decoding Phase0 Config file %v: %v", cfg.Chain.Phase0Path, err)
-		} else {
-			cfg.Chain.Phase0 = *phase0
+			return err
+		}
+	} else {
+		f, err := os.Open(cfg.Chain.ConfigPath)
+		if err != nil {
+			return fmt.Errorf("error opening Chain Config file %v: %w", cfg.Chain.ConfigPath, err)
+		}
+		var chainConfig *types.ChainConfig
+		decoder := yaml.NewDecoder(f)
+		err = decoder.Decode(&chainConfig)
+		if err != nil {
+			return fmt.Errorf("error decoding Chain Config file %v: %v", cfg.Chain.ConfigPath, err)
+		}
+		cfg.Chain.Config = *chainConfig
+	}
+	cfg.Chain.Name = cfg.Chain.Config.ConfigName
+
+	if cfg.Chain.GenesisTimestamp == 0 {
+		switch cfg.Chain.Name {
+		case "mainnet":
+			cfg.Chain.GenesisTimestamp = 1606824023
+		case "prater":
+			cfg.Chain.GenesisTimestamp = 1616508000
+		case "ropsten":
+			cfg.Chain.GenesisTimestamp = 1653922800
+		case "sepolia":
+			cfg.Chain.GenesisTimestamp = 1655733600
+		default:
+			return fmt.Errorf("tried to set known genesis-timestamp, but unknown chain-name")
 		}
 	}
 
-	// decode altair config
-	if len(cfg.Chain.AltairPath) == 0 {
-		cfg.Chain.AltairPath = "config/altair.yml"
-	}
-	altair := &types.Altair{}
-	f, err = os.Open(cfg.Chain.AltairPath)
-	if err != nil {
-		logrus.Errorf("error opening altair config file %v: %v", cfg.Chain.AltairPath, err)
-	} else {
-		decoder := yaml.NewDecoder(f)
-		err = decoder.Decode(altair)
-		if err != nil {
-			logrus.Errorf("error decoding altair Config file %v: %v", cfg.Chain.AltairPath, err)
-		} else {
-			cfg.Chain.Altair = *altair
-		}
-	}
+	logrus.WithFields(logrus.Fields{
+		"genesisTimestamp":       cfg.Chain.GenesisTimestamp,
+		"configName":             cfg.Chain.Config.ConfigName,
+		"depositChainID":         cfg.Chain.Config.DepositChainID,
+		"depositNetworkID":       cfg.Chain.Config.DepositNetworkID,
+		"depositContractAddress": cfg.Chain.Config.DepositContractAddress,
+	}).Infof("did init config")
 
 	return nil
 }
 
 func readConfigFile(cfg *types.Config, path string) error {
+	if path == "" {
+		return yaml.Unmarshal([]byte(config.DefaultConfigYml), cfg)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("error opening config file %v: %v", path, err)
@@ -336,7 +444,6 @@ func CORSMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		next.ServeHTTP(w, r)
-		return
 	})
 }
 
@@ -346,6 +453,7 @@ func IsApiRequest(r *http.Request) bool {
 }
 
 var eth1AddressRE = regexp.MustCompile("^0?x?[0-9a-fA-F]{40}$")
+var eth1TxRE = regexp.MustCompile("^0?x?[0-9a-fA-F]{64}$")
 var zeroHashRE = regexp.MustCompile("^0?x?0+$")
 
 // IsValidEth1Address verifies whether a string represents a valid eth1-address.
@@ -353,10 +461,20 @@ func IsValidEth1Address(s string) bool {
 	return !zeroHashRE.MatchString(s) && eth1AddressRE.MatchString(s)
 }
 
+// IsEth1Address verifies whether a string represents an eth1-address. In contrast to IsValidEth1Address, this also returns true for the 0x0 address
+func IsEth1Address(s string) bool {
+	return eth1AddressRE.MatchString(s)
+}
+
+// IsValidEth1Tx verifies whether a string represents a valid eth1-tx-hash.
+func IsValidEth1Tx(s string) bool {
+	return !zeroHashRE.MatchString(s) && eth1TxRE.MatchString(s)
+}
+
 // https://github.com/badoux/checkmail/blob/f9f80cb795fa/checkmail.go#L37
 var emailRE = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
 
-// IsValidEmail verifies wheter a string represents a valid email-address.
+// IsValidEmail verifies whether a string represents a valid email-address.
 func IsValidEmail(s string) bool {
 	return emailRE.MatchString(s)
 }
@@ -412,22 +530,16 @@ func SqlRowsToJSON(rows *sql.Rows) ([]interface{}, error) {
 			switch v.DatabaseTypeName() {
 			case "VARCHAR", "TEXT", "UUID":
 				scanArgs[i] = new(sql.NullString)
-				break
 			case "BOOL":
 				scanArgs[i] = new(sql.NullBool)
-				break
 			case "INT4", "INT8":
 				scanArgs[i] = new(sql.NullInt64)
-				break
 			case "FLOAT8":
 				scanArgs[i] = new(sql.NullFloat64)
-				break
 			case "TIMESTAMP":
 				scanArgs[i] = new(sql.NullTime)
-				break
 			case "_INT4", "_INT8":
 				scanArgs[i] = new(pq.Int64Array)
-				break
 			default:
 				scanArgs[i] = new(sql.NullString)
 			}
@@ -537,7 +649,7 @@ func ExchangeRateForCurrency(currency string) float64 {
 	return price.GetEthPrice(currency)
 }
 
-// Glob walks through a directory and returns files with a given extention
+// Glob walks through a directory and returns files with a given extension
 func Glob(dir string, ext string) ([]string, error) {
 	files := []string{}
 	err := filepath.Walk(dir, func(path string, f os.FileInfo, err error) error {
@@ -573,7 +685,7 @@ func ValidateReCAPTCHA(recaptchaResponse string) (bool, error) {
 		return false, err
 	}
 	if len(googleResponse.ErrorCodes) > 0 {
-		err = fmt.Errorf("Error validating ReCaptcha %v", googleResponse.ErrorCodes)
+		err = fmt.Errorf("error validating ReCaptcha %v", googleResponse.ErrorCodes)
 	} else {
 		err = nil
 	}
@@ -582,7 +694,7 @@ func ValidateReCAPTCHA(recaptchaResponse string) (bool, error) {
 		return true, err
 	}
 
-	return false, fmt.Errorf("Score too low threshold not reached, Score: %v - Required >0.5; %v", googleResponse.Score, err)
+	return false, fmt.Errorf("score too low threshold not reached, Score: %v - Required >0.5; %v", googleResponse.Score, err)
 }
 
 func BitAtVector(b []byte, i int) bool {
@@ -596,8 +708,209 @@ func BitAtVectorReversed(b []byte, i int) bool {
 }
 
 func GetNetwork() string {
-	if Config.Chain.Network != "" {
-		return strings.ToLower(Config.Chain.Network)
+	return strings.ToLower(Config.Chain.Config.ConfigName)
+}
+
+func ElementExists(arr []string, el string) bool {
+	for _, e := range arr {
+		if e == el {
+			return true
+		}
 	}
-	return strings.ToLower(Config.Chain.Phase0.ConfigName)
+	return false
+}
+
+func TryFetchContractMetadata(address []byte) (*types.ContractMetadata, error) {
+	meta, err := getABIFromEtherscan(address)
+
+	if err != nil {
+		logrus.Warnf("failed to get abi for contract %x from etherscan: %v", address, err)
+		return nil, fmt.Errorf("contract abi not found")
+	}
+	return meta, nil
+}
+
+// func getABIFromSourcify(address []byte) (*types.ContractMetadata, error) {
+// 	httpClient := http.Client{
+// 		Timeout: time.Second * 5,
+// 	}
+
+// 	resp, err := httpClient.Get(fmt.Sprintf("https://sourcify.dev/server/repository/contracts/full_match/%d/0x%x/metadata.json", 1, address))
+// 	if err != nil {
+// 		return nil, err
+// 	}
+
+// 	if resp.StatusCode == 200 {
+// 		body, err := ioutil.ReadAll(resp.Body)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		data := &types.SourcifyContractMetadata{}
+// 		err = json.Unmarshal(body, data)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		abiString, err := json.Marshal(data.Output.Abi)
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		contractAbi, err := abi.JSON(bytes.NewReader(abiString))
+// 		if err != nil {
+// 			return nil, err
+// 		}
+
+// 		meta := &types.ContractMetadata{}
+// 		meta.ABIJson = abiString
+// 		meta.ABI = &contractAbi
+// 		meta.Name = ""
+
+// 		return meta, nil
+// 	} else {
+// 		return nil, fmt.Errorf("sourcify contract code not found")
+// 	}
+// }
+
+func getABIFromEtherscan(address []byte) (*types.ContractMetadata, error) {
+	httpClient := http.Client{
+		Timeout: time.Second * 5,
+	}
+
+	baseUrl := "api.etherscan.io"
+
+	if Config.Chain.Config.DepositChainID == 5 {
+		baseUrl = "api-goerli.etherscan.io"
+	}
+	resp, err := httpClient.Get(fmt.Sprintf("https://%s/api?module=contract&action=getsourcecode&address=0x%x&apikey=%s", baseUrl, address, ""))
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == 200 {
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+
+		data := &types.EtherscanContractMetadata{}
+		err = json.Unmarshal(body, data)
+		if err != nil {
+			return nil, err
+		}
+
+		contractAbi, err := abi.JSON(strings.NewReader(data.Result[0].Abi))
+		if err != nil {
+			return nil, err
+		}
+		meta := &types.ContractMetadata{}
+		meta.ABIJson = []byte(data.Result[0].Abi)
+		meta.ABI = &contractAbi
+		meta.Name = data.Result[0].ContractName
+		return meta, nil
+	} else {
+		return nil, fmt.Errorf("etherscan contract code not found")
+	}
+}
+
+func FormatThousandsEnglish(number string) string {
+	runes := []rune(number)
+	cnt := 0
+	for _, rune := range runes {
+		if rune == '.' {
+			break
+		}
+		cnt += 1
+	}
+	amt := cnt / 3
+	rem := cnt % 3
+
+	if rem == 0 {
+		amt -= 1
+	}
+
+	res := make([]rune, 0, amt+rem)
+	if amt <= 0 {
+		return number
+	}
+	for i := 0; i < len(runes); i++ {
+		if i != 0 && i == rem {
+			res = append(res, ',')
+			amt -= 1
+		}
+
+		if amt > 0 && i > rem && ((i-rem)%3) == 0 {
+			res = append(res, ',')
+			amt -= 1
+		}
+
+		res = append(res, runes[i])
+	}
+
+	return string(res)
+}
+
+// Generates a QR code for an address
+// returns two transparent base64 encoded img strings for dark and light theme
+// the first has a black QR code the second a white QR code
+func GenerateQRCodeForAddress(address []byte) (string, string, error) {
+	q, err := qrcode.New(fmt.Sprintf("0x%x", address), qrcode.Medium)
+	if err != nil {
+		return "", "", err
+	}
+
+	q.BackgroundColor = color.Transparent
+	q.ForegroundColor = color.Black
+
+	png, err := q.PNG(320)
+	if err != nil {
+		return "", "", err
+	}
+
+	q.ForegroundColor = color.White
+
+	pngInverse, err := q.PNG(320)
+	if err != nil {
+		return "", "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(png), base64.StdEncoding.EncodeToString(pngInverse), nil
+}
+
+// sliceContains reports whether the provided string is present in the given slice of strings.
+func SliceContains(list []string, target string) bool {
+	for _, s := range list {
+		if s == target {
+			return true
+		}
+	}
+	return false
+}
+
+func FormatEthstoreComparison(pool string, val float64) template.HTML {
+	prefix := ""
+	textClass := "text-danger"
+	ou := "underperforms"
+	if val > 0 {
+		prefix = "+"
+		textClass = "text-success"
+		ou = "outperforms"
+	}
+
+	return template.HTML(fmt.Sprintf(`<sub title="%s %s the ETH.STORE indicator by %s%.2f%%" data-toggle="tooltip" class="%s">(%s%.2f%%)</sub>`, pool, ou, prefix, val, textClass, prefix, val))
+}
+
+func FormatPoolPerformance(val float64) template.HTML {
+	return template.HTML(fmt.Sprintf(`<span data-toggle="tooltip" title=%f%%>%s%%</span>`, val, fmt.Sprintf("%.2f", val)))
+}
+
+func ReverseSlice[S ~[]E, E any](s S) {
+	for i, j := 0, len(s)-1; i < j; i, j = i+1, j-1 {
+		s[i], s[j] = s[j], s[i]
+	}
+}
+
+func AddBigInts(a, b []byte) []byte {
+	return new(big.Int).Add(new(big.Int).SetBytes(a), new(big.Int).SetBytes(b)).Bytes()
 }

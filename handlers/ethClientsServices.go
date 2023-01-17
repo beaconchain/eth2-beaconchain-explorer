@@ -3,17 +3,16 @@ package handlers
 import (
 	"eth2-exporter/db"
 	ethclients "eth2-exporter/ethClients"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"html/template"
 	"net/http"
 
 	"github.com/gorilla/csrf"
 )
 
-var ethClientsServicesTemplate = template.Must(template.New("ethClientsServices").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/ethClientsServices.html"))
-
 func EthClientsServices(w http.ResponseWriter, r *http.Request) {
+	var ethClientsServicesTemplate = templates.GetTemplate("layout.html", "ethClientsServices.html")
+
 	var err error
 
 	w.Header().Set("Content-Type", "text/html")
@@ -25,7 +24,7 @@ func EthClientsServices(w http.ResponseWriter, r *http.Request) {
 	// pageData.Banner = ethclients.GetBannerClients()
 	if data.User.Authenticated {
 		var dbData []string
-		err = db.FrontendDB.Select(&dbData,
+		err = db.FrontendWriterDB.Select(&dbData,
 			`select event_filter
 			 from users_subscriptions 
 			 where user_id = $1 AND event_name=$2
@@ -52,6 +51,14 @@ func EthClientsServices(w http.ResponseWriter, r *http.Request) {
 				pageData.Teku.IsUserSubscribed = true
 			case "nimbus":
 				pageData.Nimbus.IsUserSubscribed = true
+			case "erigon":
+				pageData.Erigon.IsUserSubscribed = true
+			case "rocketpool":
+				pageData.RocketpoolSmartnode.IsUserSubscribed = true
+			case "mev-boost":
+				pageData.MevBoost.IsUserSubscribed = true
+			case "lodestar":
+				pageData.Lodestar.IsUserSubscribed = true
 			default:
 				continue
 			}
@@ -60,11 +67,7 @@ func EthClientsServices(w http.ResponseWriter, r *http.Request) {
 	}
 
 	data.Data = pageData
-
-	err = ethClientsServicesTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, ethClientsServicesTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }

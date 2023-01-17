@@ -1,15 +1,19 @@
 package services
 
 import (
+	"eth2-exporter/cache"
 	"eth2-exporter/db"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
+	"fmt"
+	"sync"
 	"time"
 )
 
-func statsUpdater() {
+func statsUpdater(wg *sync.WaitGroup) {
 	sleepDuration := time.Duration(time.Minute)
 
+	firstrun := true
 	for {
 		latestEpoch := LatestEpoch()
 
@@ -21,7 +25,17 @@ func statsUpdater() {
 			continue
 		}
 		logger.WithField("epoch", latestEpoch).WithField("duration", time.Since(now)).Info("stats update completed")
-		latestStats.Store(statResult)
+
+		cacheKey := fmt.Sprintf("%d:frontend:latestStats", utils.Config.Chain.Config.DepositChainID)
+		err = cache.TieredCache.Set(cacheKey, statResult, time.Hour*24)
+		if err != nil {
+			logger.Errorf("error caching latestStats: %v", err)
+		}
+		if firstrun {
+			wg.Done()
+			firstrun = false
+		}
+		ReportStatus("statsUpdater", "Running", nil)
 		time.Sleep(sleepDuration)
 	}
 }
@@ -66,7 +80,7 @@ func calculateStats() (*types.Stats, error) {
 
 	stats.PendingValidatorCount = &pendingValidatorCount
 
-	validatorChurnLimit, err := GetValidatorChurnLimit()
+	validatorChurnLimit, err := getValidatorChurnLimit(activeValidatorCount)
 	if err != nil {
 		logger.WithError(err).Error("error getting total validator churn limit")
 	}
@@ -79,7 +93,7 @@ func calculateStats() (*types.Stats, error) {
 func eth1TopDepositers() (*[]types.StatsTopDepositors, error) {
 	topDepositors := []types.StatsTopDepositors{}
 
-	err := db.DB.Select(&topDepositors, `
+	err := db.WriterDb.Select(&topDepositors, `
 	SELECT 
 		ENCODE(from_address::bytea, 'hex') as from_address, 
 		count(from_address) as count 
@@ -99,7 +113,7 @@ func eth1TopDepositers() (*[]types.StatsTopDepositors, error) {
 func eth1InvalidDeposits() (*uint64, error) {
 	count := uint64(0)
 
-	err := db.DB.Get(&count, `
+	err := db.WriterDb.Get(&count, `
 	SELECT 
 		count(*) as count
 	FROM eth1_deposits
@@ -116,7 +130,7 @@ func eth1InvalidDeposits() (*uint64, error) {
 func eth1UniqueValidatorsCount() (*uint64, error) {
 	count := uint64(0)
 
-	err := db.DB.Get(&count, `
+	err := db.WriterDb.Get(&count, `
 	SELECT 
 		count(*) as count
 	FROM 
@@ -141,19 +155,12 @@ func eth1UniqueValidatorsCount() (*uint64, error) {
 }
 
 // GetValidatorChurnLimit returns the rate at which validators can enter or leave the system
-func GetValidatorChurnLimit() (uint64, error) {
-	min := utils.Config.Chain.MinPerEpochChurnLimit
-
-	stats := GetLatestStats()
-	count := stats.ActiveValidatorCount
-
-	if count == nil {
-		count = new(uint64)
-	}
+func getValidatorChurnLimit(validatorCount uint64) (uint64, error) {
+	min := utils.Config.Chain.Config.MinPerEpochChurnLimit
 
 	adaptable := uint64(0)
-	if *count > 0 {
-		adaptable = utils.Config.Chain.ChurnLimitQuotient / *count
+	if validatorCount > 0 {
+		adaptable = validatorCount / utils.Config.Chain.Config.ChurnLimitQuotient
 	}
 
 	if min > adaptable {

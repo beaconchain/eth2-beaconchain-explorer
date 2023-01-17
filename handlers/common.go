@@ -1,17 +1,23 @@
 package handlers
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"eth2-exporter/db"
 	"eth2-exporter/price"
 	"eth2-exporter/services"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
+	"html/template"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 
+	"github.com/gorilla/sessions"
 	"github.com/lib/pq"
 )
 
@@ -19,7 +25,7 @@ var pkeyRegex = regexp.MustCompile("[^0-9A-Fa-f]+")
 
 func GetValidatorOnlineThresholdSlot() uint64 {
 	latestProposedSlot := services.LatestProposedSlot()
-	threshold := utils.Config.Chain.SlotsPerEpoch * 2
+	threshold := utils.Config.Chain.Config.SlotsPerEpoch * 2
 
 	var validatorOnlineThresholdSlot uint64
 	if latestProposedSlot < 1 || latestProposedSlot < threshold {
@@ -51,7 +57,7 @@ func GetValidatorEarnings(validators []uint64, currency string) (*types.Validato
 
 	balances := []*types.Validator{}
 
-	err := db.DB.Select(&balances, `SELECT 
+	err := db.ReaderDb.Select(&balances, `SELECT 
 			   COALESCE(balance, 0) AS balance, 
 			   COALESCE(balanceactivation, 0) AS balanceactivation, 
 			   COALESCE(balance1d, 0) AS balance1d, 
@@ -71,7 +77,7 @@ func GetValidatorEarnings(validators []uint64, currency string) (*types.Validato
 		Publickey []byte
 	}{}
 
-	err = db.DB.Select(&deposits, "SELECT block_slot / 32 AS epoch, amount, publickey FROM blocks_deposits WHERE publickey IN (SELECT pubkey FROM validators WHERE validatorindex = ANY($1))", validatorsPQArray)
+	err = db.ReaderDb.Select(&deposits, "SELECT block_slot / 32 AS epoch, amount, publickey FROM blocks_deposits WHERE publickey IN (SELECT pubkey FROM validators WHERE validatorindex = ANY($1))", validatorsPQArray)
 	if err != nil {
 		return nil, err
 	}
@@ -122,10 +128,14 @@ func GetValidatorEarnings(validators []uint64, currency string) (*types.Validato
 			balance.Balance31d = balance.BalanceActivation
 		}
 
-		earningsTotal += int64(balance.Balance) - int64(balance.BalanceActivation)
-		earningsLastDay += int64(balance.Balance) - int64(balance.Balance1d)
-		earningsLastWeek += int64(balance.Balance) - int64(balance.Balance7d)
-		earningsLastMonth += int64(balance.Balance) - int64(balance.Balance31d)
+		earningsTotal += int64(balance.Balance) - balance.BalanceActivation.Int64
+		earningsLastDay += int64(balance.Balance) - balance.Balance1d.Int64
+		earningsLastWeek += int64(balance.Balance) - balance.Balance7d.Int64
+		earningsLastMonth += int64(balance.Balance) - balance.Balance31d.Int64
+	}
+
+	if totalDeposits == 0 {
+		totalDeposits = 32 * 1e9
 	}
 
 	apr = (((float64(earningsLastWeek) / 1e9) / (float64(totalDeposits) / 1e9)) * 365) / 7
@@ -162,7 +172,7 @@ func LatestState(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		logger.Errorf("error sending latest index page data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 }
@@ -214,18 +224,130 @@ func GetCurrentPrice(r *http.Request) uint64 {
 	return price.GetEthRoundPrice(price.GetEthPrice(cookie.Value))
 }
 
-func GetCurrentPriceFormatted(r *http.Request) string {
+func GetCurrentPriceFormatted(r *http.Request) template.HTML {
 	userAgent := r.Header.Get("User-Agent")
 	userAgent = strings.ToLower(userAgent)
 	price := GetCurrentPrice(r)
 	if strings.Contains(userAgent, "android") || strings.Contains(userAgent, "iphone") || strings.Contains(userAgent, "windows phone") {
-		return fmt.Sprintf("%s", utils.KFormatterEthPrice(price))
+		return utils.KFormatterEthPrice(price)
 	}
-	return fmt.Sprintf("%s", utils.FormatAddCommas(uint64(price)))
+	return utils.FormatAddCommas(uint64(price))
 }
 
 func GetTruncCurrentPriceFormatted(r *http.Request) string {
 	price := GetCurrentPrice(r)
 	symbol := GetCurrencySymbol(r)
 	return fmt.Sprintf("%s %s", symbol, utils.KFormatterEthPrice(price))
+}
+
+// GetValidatorIndexFrom gets the validator index from users input
+func GetValidatorIndexFrom(userInput string) (pubKey []byte, validatorIndex uint64, err error) {
+	validatorIndex, err = strconv.ParseUint(userInput, 10, 64)
+	if err == nil {
+		pubKey, err = db.GetValidatorPublicKey(validatorIndex)
+		return
+	}
+
+	pubKey, err = hex.DecodeString(strings.Replace(userInput, "0x", "", -1))
+	if err == nil {
+		validatorIndex, err = db.GetValidatorIndex(pubKey)
+		return
+	}
+	return
+}
+
+func DataTableStateChanges(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	user, session, err := getUserSession(r)
+	if err != nil {
+		logger.Errorf("error retrieving session: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+
+	response := &types.ApiResponse{}
+	response.Status = "ERROR"
+
+	defer json.NewEncoder(w).Encode(response)
+
+	settings := types.DataTableSaveState{}
+	err = json.NewDecoder(r.Body).Decode(&settings)
+	if err != nil {
+		logger.Errorf("error saving data table state could not parse body: %v", err)
+		response.Status = "error saving table state"
+		return
+	}
+
+	key := settings.Key
+	if len(key) == 0 {
+		logger.Errorf("no key provided")
+		response.Status = "error saving table state"
+		return
+	}
+
+	if !user.Authenticated {
+		dataTableStatePrefix := "table:state:" + utils.GetNetwork() + ":"
+		key = dataTableStatePrefix + key
+		count := 0
+		for k := range session.Values {
+			k, ok := k.(string)
+			if ok && strings.HasPrefix(k, dataTableStatePrefix) {
+				count += 1
+			}
+		}
+		if count > 50 {
+			_, ok := session.Values[key]
+			if !ok {
+				logger.Errorf("error maximum number of datatable states stored in session")
+				return
+			}
+		}
+		session.Values[key] = settings
+
+		err := session.Save(r, w)
+		if err != nil {
+			logger.WithError(err).Errorf("error updating session with key: %v and value: %v", key, settings)
+		}
+
+	} else {
+		err = db.SaveDataTableState(user.UserID, settings.Key, settings)
+		if err != nil {
+			logger.Errorf("error saving data table state could save values to db: %v", err)
+			response.Status = "error saving table state"
+			return
+		}
+	}
+
+	response.Status = "OK"
+	response.Data = ""
+}
+
+func GetDataTableState(user *types.User, session *sessions.Session, tableKey string) (*types.DataTableSaveState, error) {
+	if user.Authenticated {
+		state, err := db.GetDataTablesState(user.UserID, tableKey)
+		if err != nil {
+			return nil, err
+		}
+		return state, nil
+	}
+	stateRaw, exists := session.Values["table:state:"+utils.GetNetwork()+":"+tableKey]
+	if !exists {
+		return nil, nil
+	}
+	state, ok := stateRaw.(types.DataTableSaveState)
+	if !ok {
+		return nil, fmt.Errorf("error parsing session value into type DataTableSaveState")
+	}
+	return &state, nil
+}
+
+// used to handle errors constructed by Template.ExecuteTemplate correctly
+func handleTemplateError(w http.ResponseWriter, r *http.Request, err error) error {
+	// ignore network related errors
+	if err != nil && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ETIMEDOUT) {
+		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+	}
+	return err
 }

@@ -2,12 +2,14 @@ package exporter
 
 import (
 	"context"
+	"encoding/hex"
 	"eth2-exporter/db"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -16,19 +18,18 @@ import (
 	gethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	gethRPC "github.com/ethereum/go-ethereum/rpc"
-	"github.com/prysmaticlabs/prysm/beacon-chain/core/helpers"
-	contracts "github.com/prysmaticlabs/prysm/contracts/deposit-contract"
-	ethpb "github.com/prysmaticlabs/prysm/proto/prysm/v1alpha1"
-	"github.com/prysmaticlabs/prysm/shared/bytesutil"
-	"github.com/prysmaticlabs/prysm/shared/depositutil"
-	"github.com/prysmaticlabs/prysm/shared/hashutil"
-	"github.com/prysmaticlabs/prysm/shared/params"
+	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/signing"
+	"github.com/prysmaticlabs/prysm/v3/config/params"
+	"github.com/prysmaticlabs/prysm/v3/contracts/deposit"
+	"github.com/prysmaticlabs/prysm/v3/crypto/hash"
+	"github.com/prysmaticlabs/prysm/v3/encoding/bytesutil"
+	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
 	"github.com/sirupsen/logrus"
 )
 
 var eth1LookBack = uint64(100)
 var eth1MaxFetch = uint64(1000)
-var eth1DepositEventSignature = hashutil.HashKeccak256([]byte("DepositEvent(bytes,bytes,bytes,bytes,bytes)"))
+var eth1DepositEventSignature = hash.HashKeccak256([]byte("DepositEvent(bytes,bytes,bytes,bytes,bytes)"))
 var eth1DepositContractFirstBlock uint64
 var eth1DepositContractAddress common.Address
 var eth1Client *ethclient.Client
@@ -44,7 +45,7 @@ func eth1DepositsExporter() {
 	eth1DepositContractAddress = common.HexToAddress(utils.Config.Indexer.Eth1DepositContractAddress)
 	eth1DepositContractFirstBlock = utils.Config.Indexer.Eth1DepositContractFirstBlock
 
-	rpcClient, err := gethRPC.Dial(utils.Config.Indexer.Eth1Endpoint)
+	rpcClient, err := gethRPC.Dial(utils.Config.Eth1GethEndpoint)
 	if err != nil {
 		logger.Fatal(err)
 	}
@@ -58,18 +59,23 @@ func eth1DepositsExporter() {
 		t0 := time.Now()
 
 		var lastDepositBlock uint64
-		err = db.DB.Get(&lastDepositBlock, "select coalesce(max(block_number),0) from eth1_deposits")
+		err = db.WriterDb.Get(&lastDepositBlock, "select coalesce(max(block_number),0) from eth1_deposits")
 		if err != nil {
 			logger.WithError(err).Errorf("error retrieving highest block_number of eth1-deposits from db")
 			time.Sleep(time.Second * 5)
 			continue
 		}
-		header, err := eth1Client.HeaderByNumber(context.Background(), nil)
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+		header, err := eth1Client.HeaderByNumber(ctx, nil)
 		if err != nil {
 			logger.WithError(err).Errorf("error getting header from eth1-client")
+			cancel()
 			time.Sleep(time.Second * 5)
 			continue
 		}
+		cancel()
+
 		blockHeight := header.Number.Uint64()
 
 		fromBlock := lastDepositBlock + 1
@@ -91,8 +97,8 @@ func eth1DepositsExporter() {
 			toBlock = blockHeight
 		}
 		// if we are synced to the head look at the last 100 blocks
-		if toBlock-fromBlock < eth1LookBack {
-			fromBlock = toBlock - 100
+		if (toBlock-fromBlock < eth1LookBack) && (toBlock > eth1LookBack) {
+			fromBlock = toBlock - eth1LookBack
 		}
 
 		depositsToSave, err := fetchEth1Deposits(fromBlock, toBlock)
@@ -141,6 +147,9 @@ func eth1DepositsExporter() {
 }
 
 func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1Deposit, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+	defer cancel()
+
 	qry := ethereum.FilterQuery{
 		Addresses: []common.Address{
 			eth1DepositContractAddress,
@@ -149,7 +158,7 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 		ToBlock:   new(big.Int).SetUint64(toBlock),
 	}
 
-	depositLogs, err := eth1Client.FilterLogs(context.Background(), qry)
+	depositLogs, err := eth1Client.FilterLogs(ctx, qry)
 	if err != nil {
 		return depositsToSave, fmt.Errorf("error getting logs from eth1-client: %w", err)
 	}
@@ -158,34 +167,39 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 	txsToFetch := []string{}
 
 	cfg := params.BeaconConfig()
-	domain, err := helpers.ComputeDomain(
+	genForkVersion, err := hex.DecodeString(strings.Replace(utils.Config.Chain.Config.GenesisForkVersion, "0x", "", -1))
+	// genForkVersion, err := hex.DecodeString(strings.Replace(utils.Config.Chain.Config.GenesisForkVersion.String(), "0x", "", -1))
+	if err != nil {
+		return nil, err
+	}
+	domain, err := signing.ComputeDomain(
 		cfg.DomainDeposit,
-		cfg.GenesisForkVersion,
+		genForkVersion,
 		cfg.ZeroHash[:],
 	)
-	if utils.Config.Chain.Network == "zinken" {
-		domain, err = helpers.ComputeDomain(
+	if utils.Config.Chain.Config.ConfigName == "zinken" {
+		domain, err = signing.ComputeDomain(
 			cfg.DomainDeposit,
 			[]byte{0x00, 0x00, 0x00, 0x03},
 			cfg.ZeroHash[:],
 		)
 	}
-	if utils.Config.Chain.Network == "toledo" {
-		domain, err = helpers.ComputeDomain(
+	if utils.Config.Chain.Config.ConfigName == "toledo" {
+		domain, err = signing.ComputeDomain(
 			cfg.DomainDeposit,
 			[]byte{0x00, 0x70, 0x1E, 0xD0},
 			cfg.ZeroHash[:],
 		)
 	}
-	if utils.Config.Chain.Network == "pyrmont" {
-		domain, err = helpers.ComputeDomain(
+	if utils.Config.Chain.Config.ConfigName == "pyrmont" {
+		domain, err = signing.ComputeDomain(
 			cfg.DomainDeposit,
 			[]byte{0x00, 0x00, 0x20, 0x09},
 			cfg.ZeroHash[:],
 		)
 	}
-	if utils.Config.Chain.Network == "prater" {
-		domain, err = helpers.ComputeDomain(
+	if utils.Config.Chain.Config.ConfigName == "prater" {
+		domain, err = signing.ComputeDomain(
 			cfg.DomainDeposit,
 			[]byte{0x00, 0x00, 0x10, 0x20},
 			cfg.ZeroHash[:],
@@ -199,11 +213,11 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 		if depositLog.Topics[0] != eth1DepositEventSignature {
 			continue
 		}
-		pubkey, withdrawalCredentials, amount, signature, merkletreeIndex, err := contracts.UnpackDepositLogData(depositLog.Data)
+		pubkey, withdrawalCredentials, amount, signature, merkletreeIndex, err := deposit.UnpackDepositLogData(depositLog.Data)
 		if err != nil {
 			return depositsToSave, fmt.Errorf("error unpacking eth1-deposit-log: %x: %w", depositLog.Data, err)
 		}
-		err = depositutil.VerifyDepositSignature(&ethpb.Deposit_Data{
+		err = deposit.VerifyDepositSignature(&ethpb.Deposit_Data{
 			PublicKey:             pubkey,
 			WithdrawalCredentials: withdrawalCredentials,
 			Amount:                bytesutil.FromBytes8(amount),
@@ -261,7 +275,7 @@ func fetchEth1Deposits(fromBlock, toBlock uint64) (depositsToSave []*types.Eth1D
 }
 
 func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
-	tx, err := db.DB.Begin()
+	tx, err := db.WriterDb.Begin()
 	if err != nil {
 		return err
 	}
@@ -311,7 +325,7 @@ func saveEth1Deposits(depositsToSave []*types.Eth1Deposit) error {
 
 	err = tx.Commit()
 	if err != nil {
-		return fmt.Errorf("error commiting db-tx for eth1-deposits: %w", err)
+		return fmt.Errorf("error committing db-tx for eth1-deposits: %w", err)
 	}
 
 	return nil

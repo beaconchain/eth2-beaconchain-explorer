@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"database/sql"
 	"eth2-exporter/version"
 	"net/http"
 	"regexp"
@@ -40,12 +41,24 @@ var (
 	}, []string{"task"})
 	DBSLongRunningQueries = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "db_long_running_queries",
-		Help: "Counter of long-running-queries with datbase and query in labels",
+		Help: "Counter of long-running-queries with database and query in labels",
 	}, []string{"database", "query"})
 	Errors = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "errors",
 		Help: "Counter of errors with name in labels",
 	}, []string{"name"})
+	NotificationsCollected = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "notifications_collected",
+		Help: "Counter of notification event type that gets collected",
+	}, []string{"event_type"})
+	NotificationsQueued = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "notifications_queued",
+		Help: "Counter of notification channel and event type that gets queued",
+	}, []string{"channel", "event_type"})
+	NotificationsSent = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "notifications_sent",
+		Help: "Counter of notifications sent with the channel and notification type in the label",
+	}, []string{"channel", "status"})
 )
 
 var logger = logrus.New().WithField("module", "metrics")
@@ -60,9 +73,9 @@ func MonitorDB(db *sqlx.DB) {
 	defer t.Stop()
 	for ; true; <-t.C {
 		longRunningQueries := []struct {
-			Datname  string
-			Duration float64
-			Query    string
+			Datname  sql.NullString
+			Duration sql.NullFloat64
+			Query    sql.NullString
 		}{}
 		err := db.Select(&longRunningQueries, `select datname, extract(epoch from clock_timestamp()) - extract(epoch from query_start) as duration, query from pg_stat_activity where query != '<IDLE>' and query not ilike '%pg_stat_activity%' and query_start is not null and state = 'active' and age(clock_timestamp(), query_start) >= interval '1 minutes'`)
 		if err != nil {
@@ -70,8 +83,8 @@ func MonitorDB(db *sqlx.DB) {
 			continue
 		}
 		for _, q := range longRunningQueries {
-			normedQuery := multiWhitespaceRE.ReplaceAllString(strings.Trim(q.Query, "\t\r\n "), " ")
-			DBSLongRunningQueries.WithLabelValues(q.Datname, normedQuery).Inc()
+			normedQuery := multiWhitespaceRE.ReplaceAllString(strings.Trim(q.Query.String, "\t\r\n "), " ")
+			DBSLongRunningQueries.WithLabelValues(q.Datname.String, normedQuery).Inc()
 		}
 	}
 }

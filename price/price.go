@@ -27,24 +27,56 @@ type EthPrice struct {
 var ethPrice = new(EthPrice)
 var ethPriceMux = &sync.RWMutex{}
 
-func Init() {
-	go updateEthPrice()
+func Init(chainId uint64) {
+	go updateEthPrice(chainId)
 }
 
-func updateEthPrice() {
-	for true {
-		fetchPrice()
+func updateEthPrice(chainId uint64) {
+	errorRetrievingEthPriceCount := 0
+	for {
+		fetchPrice(chainId, &errorRetrievingEthPriceCount)
 		time.Sleep(time.Minute)
 	}
 }
 
-func fetchPrice() {
+func fetchPrice(chainId uint64, errorRetrievingEthPriceCount *int) {
+	if chainId != 1 {
+		ethPrice = &EthPrice{
+			Ethereum: struct {
+				Cad float64 "json:\"cad\""
+				Cny float64 "json:\"cny\""
+				Eur float64 "json:\"eur\""
+				Jpy float64 "json:\"jpy\""
+				Rub float64 "json:\"rub\""
+				Usd float64 "json:\"usd\""
+				Gbp float64 "json:\"gbp\""
+				Aud float64 "json:\"aud\""
+			}{
+				Cad: 0,
+				Cny: 0,
+				Eur: 0,
+				Jpy: 0,
+				Rub: 0,
+				Usd: 0,
+				Gbp: 0,
+				Aud: 0,
+			},
+		}
+		return
+	}
+
 	client := &http.Client{Timeout: time.Second * 10}
 	resp, err := client.Get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd%2Ceur%2Crub%2Ccny%2Ccad%2Cjpy%2Cgbp%2Caud")
-
 	if err != nil {
-		logger.Errorf("error retrieving ETH price: %v", err)
+		*errorRetrievingEthPriceCount++
+		if *errorRetrievingEthPriceCount <= 3 { // warn 3 times, before throwing errors starting with the fourth time
+			logger.Warnf("error (%d) retrieving ETH price: %v", *errorRetrievingEthPriceCount, err)
+		} else {
+			logger.Errorf("error (%d) retrieving ETH price: %v", *errorRetrievingEthPriceCount, err)
+		}
 		return
+	} else {
+		*errorRetrievingEthPriceCount = 0
 	}
 
 	ethPriceMux.Lock()
@@ -52,7 +84,6 @@ func fetchPrice() {
 	defer resp.Body.Close()
 
 	err = json.NewDecoder(resp.Body).Decode(&ethPrice)
-
 	if err != nil {
 		logger.Errorf("error decoding ETH price json response to struct: %v", err)
 		return
@@ -82,6 +113,30 @@ func GetEthPrice(currency string) float64 {
 		return ethPrice.Ethereum.Gbp
 	default:
 		return 1
+	}
+}
+
+func GetSymbol(currency string) string {
+
+	switch currency {
+	case "EUR":
+		return "€"
+	case "USD":
+		return "$"
+	case "RUB":
+		return "₽"
+	case "CNY":
+		return "¥"
+	case "CAD":
+		return "C$"
+	case "AUD":
+		return "A$"
+	case "JPY":
+		return "¥"
+	case "GBP":
+		return "£"
+	default:
+		return ""
 	}
 }
 

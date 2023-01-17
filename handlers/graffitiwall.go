@@ -2,15 +2,13 @@ package handlers
 
 import (
 	"eth2-exporter/db"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"html/template"
 	"net/http"
 )
 
-var graffitiwallTemplate = template.Must(template.New("vis").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/graffitiwall.html"))
-
 func Graffitiwall(w http.ResponseWriter, r *http.Request) {
+	var graffitiwallTemplate = templates.GetTemplate("layout.html", "graffitiwall.html")
 
 	var err error
 
@@ -18,11 +16,11 @@ func Graffitiwall(w http.ResponseWriter, r *http.Request) {
 
 	var graffitiwallData []*types.GraffitiwallData
 
-	err = db.DB.Select(&graffitiwallData, "select x, y, color, slot, validator from graffitiwall")
+	err = db.ReaderDb.Select(&graffitiwallData, "select x, y, color, slot, validator from graffitiwall")
 
 	if err != nil {
 		logger.Errorf("error retrieving block tree data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -30,11 +28,7 @@ func Graffitiwall(w http.ResponseWriter, r *http.Request) {
 	data.HeaderAd = true
 	data.Data = graffitiwallData
 
-	err = graffitiwallTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, graffitiwallTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"eth2-exporter/db"
 	"eth2-exporter/services"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
@@ -17,9 +18,7 @@ import (
 	"github.com/gorilla/csrf"
 )
 
-var validatorRewardsServicesTemplate = template.Must(template.New("validatorRewards").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/validatorRewards.html"))
-
-// var supportedCurrencies = []string{"eur", "usd", "gbp", "cny", "cad", "jpy", "rub"}
+// var supportedCurrencies = []string{"eur", "usd", "gbp", "cny", "cad", "jpy", "rub", "aud"}
 
 type rewardsResp struct {
 	Currencies        []string
@@ -29,6 +28,8 @@ type rewardsResp struct {
 }
 
 func ValidatorRewards(w http.ResponseWriter, r *http.Request) {
+	var validatorRewardsServicesTemplate = templates.GetTemplate("layout.html", "validatorRewards.html")
+
 	var err error
 
 	w.Header().Set("Content-Type", "text/html")
@@ -36,7 +37,7 @@ func ValidatorRewards(w http.ResponseWriter, r *http.Request) {
 	data := InitPageData(w, r, "services", "/rewards", "Ethereum Validator Rewards")
 
 	var supportedCurrencies []string
-	err = db.DB.Select(&supportedCurrencies,
+	err = db.ReaderDb.Select(&supportedCurrencies,
 		`select column_name 
 			from information_schema.columns 
 			where table_name = 'price'`)
@@ -45,7 +46,7 @@ func ValidatorRewards(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var minTime time.Time
-	err = db.DB.Get(&minTime,
+	err = db.ReaderDb.Get(&minTime,
 		`select ts from price order by ts asc limit 1`)
 	if err != nil {
 		logger.Errorf("error getting min ts: %w", err)
@@ -53,17 +54,14 @@ func ValidatorRewards(w http.ResponseWriter, r *http.Request) {
 
 	data.Data = rewardsResp{Currencies: supportedCurrencies, CsrfField: csrf.TemplateField(r), MinDateTimestamp: uint64(minTime.Unix()), ShowSubscriptions: data.User.Authenticated}
 
-	err = validatorRewardsServicesTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, validatorRewardsServicesTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
 func getUserRewardSubscriptions(uid uint64) [][]string {
 	var dbResp []types.Subscription
-	err := db.FrontendDB.Select(&dbResp,
+	err := db.FrontendWriterDB.Select(&dbResp,
 		`select * from users_subscriptions where event_name=$1 AND user_id=$2`, strings.ToLower(utils.GetNetwork())+":"+string(types.TaxReportEventName), uid)
 	if err != nil {
 		logger.Errorf("error getting prices: %w", err)
@@ -88,7 +86,7 @@ func getUserRewardSubscriptions(uid uint64) [][]string {
 
 func isValidCurrency(currency string) bool {
 	var count uint64
-	err := db.DB.Get(&count,
+	err := db.ReaderDb.Get(&count,
 		`select count(column_name) 
 		from information_schema.columns 
 		where table_name = 'price' AND column_name=$1;`, currency)
@@ -123,6 +121,11 @@ func RewardsHistoricalData(w http.ResponseWriter, r *http.Request) {
 	dateRange := strings.Split(q.Get("days"), "-")
 	if len(dateRange) == 2 {
 		start, err = strconv.ParseUint(dateRange[0], 10, 64)
+		if err != nil {
+			logger.Errorf("error retrieving days range %v", err)
+			http.Error(w, "Invalid query", 400)
+			return
+		}
 		end, err = strconv.ParseUint(dateRange[1], 10, 64)
 		if err != nil {
 			logger.Errorf("error retrieving days range %v", err)
@@ -136,7 +139,7 @@ func RewardsHistoricalData(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.WithError(err).WithField("route", r.URL.String()).Error("error encoding json response")
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -159,6 +162,11 @@ func DownloadRewardsHistoricalData(w http.ResponseWriter, r *http.Request) {
 	dateRange := strings.Split(q.Get("days"), "-")
 	if len(dateRange) == 2 {
 		start, err = strconv.ParseUint(dateRange[0], 10, 64)
+		if err != nil {
+			logger.Errorf("error retrieving days range %v", err)
+			http.Error(w, "Invalid query", 400)
+			return
+		}
 		end, err = strconv.ParseUint(dateRange[1], 10, 64)
 		if err != nil {
 			logger.Errorf("error retrieving days range %v", err)
@@ -180,10 +188,10 @@ func DownloadRewardsHistoricalData(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=income_history_%v_%v.pdf", s.Format("20060102"), e.Format("20060102")))
 	w.Header().Set("Content-Type", "text/csv")
 
-	_, err = w.Write(services.GeneratePdfReport(hist))
+	_, err = w.Write(services.GeneratePdfReport(hist, currency))
 	if err != nil {
 		logger.WithError(err).WithField("route", r.URL.String()).Error("error writing response")
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -199,7 +207,7 @@ func RewardNotificationSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var count uint64
-	err := db.FrontendDB.Get(&count,
+	err := db.FrontendWriterDB.Get(&count,
 		`select count(event_name) 
 		from users_subscriptions 
 		where user_id=$1 AND event_name=$2;`, user.UserID, strings.ToLower(utils.GetNetwork())+":"+string(types.TaxReportEventName))
@@ -229,7 +237,7 @@ func RewardNotificationSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err = db.AddSubscription(user.UserID,
-		utils.Config.Chain.Phase0.ConfigName,
+		utils.Config.Chain.Config.ConfigName,
 		types.TaxReportEventName,
 		fmt.Sprintf("validators=%s&days=30&currency=%s", validatorArr, currency), 0)
 
@@ -245,7 +253,7 @@ func RewardNotificationSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		logger.WithError(err).WithField("route", r.URL.String()).Error("error encoding json response")
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -289,7 +297,7 @@ func RewardNotificationUnsubscribe(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		logger.WithError(err).WithField("route", r.URL.String()).Error("error encoding json response")
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 }
@@ -304,7 +312,7 @@ func RewardGetUserSubscriptions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var count uint64
-	err := db.FrontendDB.Get(&count,
+	err := db.FrontendWriterDB.Get(&count,
 		`select count(event_name) 
 		from users_subscriptions 
 		where user_id=$1 AND event_name=$2;`, user.UserID, strings.ToLower(utils.GetNetwork())+":"+string(types.TaxReportEventName))
@@ -324,7 +332,7 @@ func RewardGetUserSubscriptions(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		logger.WithError(err).WithField("route", r.URL.String()).Error("error encoding json response")
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 }

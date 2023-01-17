@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"eth2-exporter/db"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
@@ -10,22 +12,61 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
-
-var blocksTemplate = template.Must(template.New("blocks").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/blocks.html"))
 
 // Blocks will return information about blocks using a go template
 func Blocks(w http.ResponseWriter, r *http.Request) {
+
+	var blocksTemplate = templates.GetTemplate("layout.html", "blocks.html")
+
 	w.Header().Set("Content-Type", "text/html")
+	q := r.URL.Query()
 
-	data := InitPageData(w, r, "blocks", "/blocks", "Blocks")
+	data := InitPageData(w, r, "blockchain", "/slots", "Slots")
 
-	err := blocksTemplate.ExecuteTemplate(w, "layout", data)
-
+	user, session, err := getUserSession(r)
 	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
+		logger.WithError(err).Error("error getting user session")
+	}
+
+	state, err := GetDataTableState(user, session, "blocks")
+	if err != nil {
+		logger.WithError(err).Error("error getting stored table state")
+	}
+
+	length := uint64(50)
+	start := uint64(0)
+	search := ""
+	searchForEmpty := false
+
+	if state != nil {
+		length = state.Length
+		start = state.Start
+		// we currently do not set search on state change
+		search = state.Search.Search
+	}
+
+	if q.Get("search[value]") != "" {
+		search = q.Get("search[value]")
+	}
+
+	if q.Get("q") != "" {
+		search = q.Get("q")
+	}
+
+	search = strings.Replace(search, "0x", "", -1)
+
+	tableData, err := GetBlocksTableData(0, start, length, search, searchForEmpty)
+	if err != nil {
+		logger.Errorf("error rendering blocks table data: %v", err)
 		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
+	}
+
+	data.Data = tableData
+	if handleTemplateError(w, r, blocksTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -36,7 +77,13 @@ func BlocksData(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
 	search := q.Get("search[value]")
+
+	if q.Get("q") != "" {
+		search = q.Get("q")
+	}
+
 	search = strings.Replace(search, "0x", "", -1)
+
 	searchForEmpty := (len(search) == 0 && q.Get("columns[11][search][value]") == "#showonlyemptygraffiti")
 
 	draw, err := strconv.ParseUint(q.Get("draw"), 10, 64)
@@ -57,19 +104,34 @@ func BlocksData(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
-	if length > 100 {
-		length = 100
+
+	tableData, err := GetBlocksTableData(draw, start, length, search, searchForEmpty)
+	if err != nil {
+		logger.Errorf("error rendering blocks table data: %v", err)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		return
 	}
 
+	err = json.NewEncoder(w).Encode(tableData)
+	if err != nil {
+		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		return
+	}
+}
+
+func GetBlocksTableData(draw, start, length uint64, search string, searchForEmpty bool) (*types.DataTableResponse, error) {
 	var totalCount uint64
 	var filteredCount uint64
 	var blocks []*types.BlocksPageDataBlocks
 
-	err = db.DB.Get(&totalCount, "SELECT COALESCE(MAX(slot),0) FROM blocks")
+	err := db.ReaderDb.Get(&totalCount, "SELECT COALESCE(MAX(slot),0) FROM blocks")
 	if err != nil {
-		logger.Errorf("error retrieving max slot number: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
-		return
+		return nil, err
+	}
+
+	if length > 100 {
+		length = 100
 	}
 
 	if search == "" && !searchForEmpty {
@@ -83,7 +145,7 @@ func BlocksData(w http.ResponseWriter, r *http.Request) {
 		if endSlot > 9223372036854775807 {
 			endSlot = 0
 		}
-		err = db.DB.Select(&blocks, `
+		err = db.ReaderDb.Select(&blocks, `
 			SELECT 
 				blocks.epoch, 
 				blocks.slot, 
@@ -106,9 +168,7 @@ func BlocksData(w http.ResponseWriter, r *http.Request) {
 			WHERE blocks.slot >= $1 AND blocks.slot <= $2
 			ORDER BY blocks.slot DESC`, endSlot, startSlot)
 		if err != nil {
-			logger.Errorf("error retrieving block data: %v", err)
-			http.Error(w, "Internal server error", http.StatusServiceUnavailable)
-			return
+			return nil, fmt.Errorf("error retrieving block data: %w", err)
 		}
 	} else {
 		// we search for blocks matching the search-string:
@@ -199,11 +259,11 @@ func BlocksData(w http.ResponseWriter, r *http.Request) {
 			LEFT JOIN (select count(*) from matched_slots) cnt(total_count) ON true
 			ORDER BY slot DESC LIMIT $%v OFFSET $%v`, searchBlocksQry, len(args)-1, len(args))
 
-		err = db.DB.Select(&blocks, qry, args...)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err = db.ReaderDb.SelectContext(ctx, &blocks, qry, args...)
 		if err != nil {
-			logger.Errorf("error retrieving block data (with search): %v", err)
-			http.Error(w, "Internal server error", http.StatusServiceUnavailable)
-			return
+			return nil, fmt.Errorf("error retrieving block data (with search): %w", err)
 		}
 
 		filteredCount = 0
@@ -252,12 +312,8 @@ func BlocksData(w http.ResponseWriter, r *http.Request) {
 		RecordsTotal:    totalCount,
 		RecordsFiltered: filteredCount,
 		Data:            tableData,
+		DisplayStart:    start,
+		PageLength:      length,
 	}
-
-	err = json.NewEncoder(w).Encode(data)
-	if err != nil {
-		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
-		return
-	}
+	return data, nil
 }

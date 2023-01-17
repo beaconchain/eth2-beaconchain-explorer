@@ -17,12 +17,18 @@ import (
 )
 
 func InitPageData(w http.ResponseWriter, r *http.Request, active, path, title string) *types.PageData {
+	fullTitle := fmt.Sprintf("%v - %v - beaconcha.in - %v", title, utils.Config.Frontend.SiteName, time.Now().Year())
+
+	if title == "" {
+		fullTitle = fmt.Sprintf("%v - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year())
+	}
+
 	user := getUser(r)
 	data := &types.PageData{
 		HeaderAd: false,
 		Meta: &types.Meta{
-			Title:       fmt.Sprintf("%v - %v - beaconcha.in - %v", utils.Config.Frontend.SiteName, title, time.Now().Year()),
-			Description: "beaconcha.in makes the Ethereum 2.0. beacon chain accessible to non-technical end users",
+			Title:       fullTitle,
+			Description: "beaconcha.in makes Ethereum accessible to non-technical end users",
 			Path:        path,
 			GATag:       utils.Config.Frontend.GATag,
 			NoTrack:     false,
@@ -31,53 +37,74 @@ func InitPageData(w http.ResponseWriter, r *http.Request, active, path, title st
 		Data:                  &types.Empty{},
 		User:                  user,
 		Version:               version.Version,
-		ChainSlotsPerEpoch:    utils.Config.Chain.SlotsPerEpoch,
-		ChainSecondsPerSlot:   utils.Config.Chain.SecondsPerSlot,
+		Year:                  time.Now().UTC().Year(),
+		ChainSlotsPerEpoch:    utils.Config.Chain.Config.SlotsPerEpoch,
+		ChainSecondsPerSlot:   utils.Config.Chain.Config.SecondsPerSlot,
 		ChainGenesisTimestamp: utils.Config.Chain.GenesisTimestamp,
 		CurrentEpoch:          services.LatestEpoch(),
 		CurrentSlot:           services.LatestSlot(),
 		FinalizationDelay:     services.FinalizationDelay(),
-		EthPrice:              0,
-		EthRoundPrice:         0,
-		EthTruncPrice:         "",
-		UsdRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("USD")),
-		UsdTruncPrice:         "",
-		EurRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("EUR")),
-		EurTruncPrice:         "",
-		GbpRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("GBP")),
-		GbpTruncPrice:         "",
-		CnyRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("CNY")),
-		CnyTruncPrice:         "",
-		RubRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("RUB")),
-		RubTruncPrice:         "",
-		CadRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("CAD")),
-		CadTruncPrice:         "",
-		AudRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("AUD")),
-		AudTruncPrice:         "",
-		JpyRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("JPY")),
-		JpyTruncPrice:         "",
-		Mainnet:               utils.Config.Chain.Mainnet,
-		DepositContract:       utils.Config.Indexer.Eth1DepositContractAddress,
-		Currency:              GetCurrency(r),
-		CurrentPriceFormatted: GetCurrentPriceFormatted(r),
-		CurrentSymbol:         GetCurrencySymbol(r),
-		ClientsUpdated:        ethclients.ClientsUpdated(),
-		Phase0:                utils.Config.Chain.Phase0,
-		Lang:                  "en-US",
-		NoAds:                 user.Authenticated && user.Subscription != "",
+		Rates: types.PageRates{
+			EthPrice:              0,
+			EthRoundPrice:         0,
+			EthTruncPrice:         "",
+			UsdRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("USD")),
+			UsdTruncPrice:         "",
+			EurRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("EUR")),
+			EurTruncPrice:         "",
+			GbpRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("GBP")),
+			GbpTruncPrice:         "",
+			CnyRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("CNY")),
+			CnyTruncPrice:         "",
+			RubRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("RUB")),
+			RubTruncPrice:         "",
+			CadRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("CAD")),
+			CadTruncPrice:         "",
+			AudRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("AUD")),
+			AudTruncPrice:         "",
+			JpyRoundPrice:         price.GetEthRoundPrice(price.GetEthPrice("JPY")),
+			JpyTruncPrice:         "",
+			Currency:              GetCurrency(r),
+			CurrentPriceFormatted: GetCurrentPriceFormatted(r),
+			CurrentSymbol:         GetCurrencySymbol(r),
+		},
+		Mainnet:            utils.Config.Chain.Config.ConfigName == "mainnet",
+		DepositContract:    utils.Config.Indexer.Eth1DepositContractAddress,
+		ClientsUpdated:     ethclients.ClientsUpdated(),
+		ChainConfig:        utils.Config.Chain.Config,
+		Lang:               "en-US",
+		NoAds:              user.Authenticated && user.Subscription != "",
+		Debug:              utils.Config.Frontend.Debug,
+		GasNow:             services.LatestGasNowData(),
+		ShowSyncingMessage: services.IsSyncing(),
 	}
-	data.EthPrice = price.GetEthPrice(data.Currency)
-	data.ExchangeRate = price.GetEthPrice(data.Currency)
-	data.EthRoundPrice = price.GetEthRoundPrice(data.EthPrice)
-	data.EthTruncPrice = utils.KFormatterEthPrice(data.EthRoundPrice)
-	data.UsdTruncPrice = utils.KFormatterEthPrice(data.UsdRoundPrice)
-	data.EurTruncPrice = utils.KFormatterEthPrice(data.EurRoundPrice)
-	data.GbpTruncPrice = utils.KFormatterEthPrice(data.GbpRoundPrice)
-	data.CnyTruncPrice = utils.KFormatterEthPrice(data.CnyRoundPrice)
-	data.RubTruncPrice = utils.KFormatterEthPrice(data.RubRoundPrice)
-	data.CadTruncPrice = utils.KFormatterEthPrice(data.CadRoundPrice)
-	data.AudTruncPrice = utils.KFormatterEthPrice(data.AudRoundPrice)
-	data.JpyTruncPrice = utils.KFormatterEthPrice(data.JpyRoundPrice)
+
+	if utils.Config.Frontend.Debug {
+		_, session, err := getUserSession(r)
+		if err != nil {
+			logger.WithError(err).Error("error getting user session")
+		}
+		if session != nil {
+			jsn := make(map[string]interface{})
+			// convert map[interface{}]interface{} -> map[string]interface{}
+			for sessionKey, sessionValue := range session.Values {
+				jsn[fmt.Sprintf("%v", sessionKey)] = sessionValue
+			}
+			data.DebugSession = jsn
+		}
+	}
+	data.Rates.EthPrice = price.GetEthPrice(data.Rates.Currency)
+	data.Rates.ExchangeRate = price.GetEthPrice(data.Rates.Currency)
+	data.Rates.EthRoundPrice = price.GetEthRoundPrice(data.Rates.EthPrice)
+	data.Rates.EthTruncPrice = utils.KFormatterEthPrice(data.Rates.EthRoundPrice)
+	data.Rates.UsdTruncPrice = utils.KFormatterEthPrice(data.Rates.UsdRoundPrice)
+	data.Rates.EurTruncPrice = utils.KFormatterEthPrice(data.Rates.EurRoundPrice)
+	data.Rates.GbpTruncPrice = utils.KFormatterEthPrice(data.Rates.GbpRoundPrice)
+	data.Rates.CnyTruncPrice = utils.KFormatterEthPrice(data.Rates.CnyRoundPrice)
+	data.Rates.RubTruncPrice = utils.KFormatterEthPrice(data.Rates.RubRoundPrice)
+	data.Rates.CadTruncPrice = utils.KFormatterEthPrice(data.Rates.CadRoundPrice)
+	data.Rates.AudTruncPrice = utils.KFormatterEthPrice(data.Rates.AudRoundPrice)
+	data.Rates.JpyTruncPrice = utils.KFormatterEthPrice(data.Rates.JpyRoundPrice)
 
 	acceptedLangs := strings.Split(r.Header.Get("Accept-Language"), ",")
 	if len(acceptedLangs) > 0 {
@@ -94,6 +121,14 @@ func InitPageData(w http.ResponseWriter, r *http.Request, active, path, title st
 	}
 
 	return data
+}
+
+func SetPageDataTitle(pageData *types.PageData, title string) {
+	if title == "" {
+		pageData.Meta.Title = fmt.Sprintf("%v - beaconcha.in - %v", utils.Config.Frontend.SiteName, time.Now().Year())
+	} else {
+		pageData.Meta.Title = fmt.Sprintf("%v - %v - beaconcha.in - %v", title, utils.Config.Frontend.SiteName, time.Now().Year())
+	}
 }
 
 func getUser(r *http.Request) *types.User {

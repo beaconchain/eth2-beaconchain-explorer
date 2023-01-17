@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"eth2-exporter/mail"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
@@ -9,9 +10,9 @@ import (
 	"net/http"
 )
 
-var advertisewithusTemplate = template.Must(template.New("advertisewithus").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/advertisewithus.html"))
-
 func AdvertiseWithUs(w http.ResponseWriter, r *http.Request) {
+	var advertisewithusTemplate = templates.GetTemplate("layout.html", "advertisewithus.html")
+
 	var err error
 
 	w.Header().Set("Content-Type", "text/html")
@@ -24,16 +25,13 @@ func AdvertiseWithUs(w http.ResponseWriter, r *http.Request) {
 	pageData.FlashMessage, err = utils.GetFlash(w, r, "ad_flash")
 	if err != nil {
 		logger.Errorf("error retrieving flashes for advertisewithusform %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
-	data.Data = pageData
 
-	err = advertisewithusTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	data.Data = pageData
+	if handleTemplateError(w, r, advertisewithusTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -80,7 +78,7 @@ func AdvertiseWithUsPost(w http.ResponseWriter, r *http.Request) {
 	// escape html
 	msg = template.HTMLEscapeString(msg)
 
-	err = mail.SendMail("support@beaconcha.in", "New ad inquiry", msg, []types.EmailAttachment{})
+	err = mail.SendTextMail("support@beaconcha.in", "New ad inquiry", msg, []types.EmailAttachment{})
 	if err != nil {
 		logger.Errorf("error sending ad form: %v", err)
 		utils.SetFlash(w, r, "ad_flash", "Error: unable to submit ad request")

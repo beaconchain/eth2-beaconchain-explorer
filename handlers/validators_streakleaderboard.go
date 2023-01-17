@@ -3,30 +3,26 @@ package handlers
 import (
 	"encoding/json"
 	"eth2-exporter/db"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
-	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
 )
 
-var validatorsStreakLeaderboardTemplate = template.Must(template.New("validators").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/validators_streakleaderboard.html"))
-
 // ValidatorsStreaksLeaderboard returns the attestation-streak-leaderboard using a go template
 func ValidatorsStreakLeaderboard(w http.ResponseWriter, r *http.Request) {
+	var validatorsStreakLeaderboardTemplate = templates.GetTemplate("layout.html", "validators_streakleaderboard.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
 	data := InitPageData(w, r, "validators", "/validators/streaksleaderboard", "Validator Streaks Leaderboard")
 	data.HeaderAd = true
 
-	err := validatorsStreakLeaderboardTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, validatorsStreakLeaderboardTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -45,19 +41,19 @@ func ValidatorsStreakLeaderboardData(w http.ResponseWriter, r *http.Request) {
 	draw, err := strconv.ParseUint(q.Get("draw"), 10, 64)
 	if err != nil {
 		logger.Errorf("error converting datatables data parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	start, err := strconv.ParseUint(q.Get("start"), 10, 64)
 	if err != nil {
 		logger.Errorf("error converting datatables start parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	length, err := strconv.ParseUint(q.Get("length"), 10, 64)
 	if err != nil {
 		logger.Errorf("error converting datatables length parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	if length > 100 {
@@ -94,7 +90,7 @@ func ValidatorsStreakLeaderboardData(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if search == "" {
-		err = db.DB.Select(&sqlData, `
+		err = db.ReaderDb.Select(&sqlData, `
 			with
 				longeststreaks as (
 					select validatorindex, start, length, rank() over(order by length desc)
@@ -121,7 +117,7 @@ func ValidatorsStreakLeaderboardData(w http.ResponseWriter, r *http.Request) {
 			left join (select count(*) from longeststreaks) cnt(totalcount) on true
 			order by `+orderBy+` `+orderDir+` limit $1 offset $2`, length, start)
 	} else {
-		err = db.DB.Select(&sqlData, `
+		err = db.ReaderDb.Select(&sqlData, `
 			with 
 				matched_validators as (
 					select v.validatorindex, v.pubkey, coalesce(vn.name,'') as name
@@ -159,7 +155,7 @@ func ValidatorsStreakLeaderboardData(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		logger.Errorf("error retrieving streaksData data (search=%v): %v", search != "", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	if len(sqlData) > 0 {
@@ -195,7 +191,7 @@ func ValidatorsStreakLeaderboardData(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 }

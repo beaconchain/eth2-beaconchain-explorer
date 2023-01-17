@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/Gurpartap/storekit-go"
@@ -47,7 +48,14 @@ func checkSubscriptions() {
 			if err != nil {
 				// error might indicate a connection problem, ignore validation response
 				// for this iteration
-				logger.Errorf("subscription verification failed in service for [%v]: %w", receipt.ID, err)
+				if strings.Contains(err.Error(), "expired") {
+					err = db.SetSubscriptionToExpired(nil, receipt.ID)
+					if err != nil {
+						logger.Errorf("subscription set expired failed for [%v]: %w", receipt.ID, err)
+					}
+					continue
+				}
+				logger.Warnf("subscription verification failed in service for [%v]: %w", receipt.ID, err)
 				continue
 			}
 
@@ -226,7 +234,7 @@ func VerifyApple(receipt *types.PremiumData) (*VerifyResponse, error) {
 }
 
 func updateValidationState(receipt *types.PremiumData, validation *VerifyResponse) {
-	err := db.UpdateUserSubscription(receipt.ID, validation.Valid, validation.ExpirationDate, validation.RejectReason)
+	err := db.UpdateUserSubscription(nil, receipt.ID, validation.Valid, validation.ExpirationDate, validation.RejectReason)
 	if err != nil {
 		fmt.Printf("error updating subscription state %v", err)
 	}

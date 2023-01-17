@@ -53,17 +53,21 @@ type EthClients struct {
 }
 
 type EthClientServicesPageData struct {
-	LastUpdate   time.Time
-	Geth         EthClients
-	Nethermind   EthClients
-	OpenEthereum EthClients
-	Besu         EthClients
-	Teku         EthClients
-	Prysm        EthClients
-	Nimbus       EthClients
-	Lighthouse   EthClients
-	Banner       string
-	CsrfField    template.HTML
+	LastUpdate          time.Time
+	Geth                EthClients
+	Nethermind          EthClients
+	OpenEthereum        EthClients
+	Besu                EthClients
+	Teku                EthClients
+	Prysm               EthClients
+	Nimbus              EthClients
+	Lighthouse          EthClients
+	Erigon              EthClients
+	RocketpoolSmartnode EthClients
+	MevBoost            EthClients
+	Lodestar            EthClients
+	Banner              string
+	CsrfField           template.HTML
 }
 
 var ethClients = EthClientServicesPageData{}
@@ -201,15 +205,18 @@ func updateEthClientNetShare() {
 	}
 
 	for _, item := range nShare {
+		share := fmt.Sprintf("%.1f%%", (float64(item.Value)/float64(total))*100.0)
 		switch item.Client {
 		case "geth":
-			ethClients.Geth.NetworkShare = fmt.Sprintf("%.1f%%", (float64(item.Value)/float64(total))*100.0)
+			ethClients.Geth.NetworkShare = share
 		case "openethereum":
-			ethClients.OpenEthereum.NetworkShare = fmt.Sprintf("%.1f%%", (float64(item.Value)/float64(total))*100.0)
+			ethClients.OpenEthereum.NetworkShare = share
 		case "nethermind":
-			ethClients.Nethermind.NetworkShare = fmt.Sprintf("%.1f%%", (float64(item.Value)/float64(total))*100.0)
+			ethClients.Nethermind.NetworkShare = share
 		case "besu":
-			ethClients.Besu.NetworkShare = fmt.Sprintf("%.1f%%", (float64(item.Value)/float64(total))*100.0)
+			ethClients.Besu.NetworkShare = share
+		case "erigon":
+			ethClients.Erigon.NetworkShare = share
 		default:
 			continue
 		}
@@ -235,11 +242,16 @@ func updateEthClient() {
 	ethClients.Nethermind.ClientReleaseVersion, ethClients.Nethermind.ClientReleaseDate = prepareEthClientData("/NethermindEth/nethermind", "Nethermind", curTime)
 	ethClients.OpenEthereum.ClientReleaseVersion, ethClients.OpenEthereum.ClientReleaseDate = prepareEthClientData("/openethereum/openethereum", "OpenEthereum", curTime)
 	ethClients.Besu.ClientReleaseVersion, ethClients.Besu.ClientReleaseDate = prepareEthClientData("/hyperledger/besu", "Besu", curTime)
+	ethClients.Erigon.ClientReleaseVersion, ethClients.Erigon.ClientReleaseDate = prepareEthClientData("/ledgerwatch/erigon", "Erigon", curTime)
 
 	ethClients.Teku.ClientReleaseVersion, ethClients.Teku.ClientReleaseDate = prepareEthClientData("/ConsenSys/teku", "Teku", curTime)
 	ethClients.Prysm.ClientReleaseVersion, ethClients.Prysm.ClientReleaseDate = prepareEthClientData("/prysmaticlabs/prysm", "Prysm", curTime)
 	ethClients.Nimbus.ClientReleaseVersion, ethClients.Nimbus.ClientReleaseDate = prepareEthClientData("/status-im/nimbus-eth2", "Nimbus", curTime)
 	ethClients.Lighthouse.ClientReleaseVersion, ethClients.Lighthouse.ClientReleaseDate = prepareEthClientData("/sigp/lighthouse", "Lighthouse", curTime)
+	ethClients.Lodestar.ClientReleaseVersion, ethClients.Lodestar.ClientReleaseDate = prepareEthClientData("/chainsafe/lodestar", "Lodestar", curTime)
+
+	ethClients.RocketpoolSmartnode.ClientReleaseVersion, ethClients.RocketpoolSmartnode.ClientReleaseDate = prepareEthClientData("/rocket-pool/smartnode-install", "Rocketpool", curTime)
+	ethClients.MevBoost.ClientReleaseVersion, ethClients.MevBoost.ClientReleaseDate = prepareEthClientData("/flashbots/mev-boost", "MEV-Boost", curTime)
 
 	ethClients.LastUpdate = curTime
 }
@@ -268,7 +280,7 @@ func ClientsUpdated() bool {
 	return true
 }
 
-//GetUpdatedClients returns a slice of latest updated clients or empty slice if no updates
+// GetUpdatedClients returns a slice of latest updated clients or empty slice if no updates
 func GetUpdatedClients() []clientUpdateInfo {
 	bannerClientsMux.Lock()
 	defer bannerClientsMux.Unlock()

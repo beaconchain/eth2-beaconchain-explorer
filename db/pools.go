@@ -58,9 +58,9 @@ func getPoolInfo() {
 	var stakePools []Pools
 	addrName := map[string]Pools{}
 
-	if utils.Config.Chain.Network == "mainnet" || utils.Config.Chain.Network == "prater" {
+	if utils.Config.Chain.Config.ConfigName == "mainnet" || utils.Config.Chain.Config.ConfigName == "prater" {
 		var stakePoolsNames []Pools
-		err := DB.Select(&stakePoolsNames, "select address, name, deposit, category from stake_pools_stats;") // deposit is a placeholder the actual value is not used on frontend
+		err := ReaderDb.Select(&stakePoolsNames, "select address, name, deposit, category from stake_pools_stats;") // deposit is a placeholder the actual value is not used on frontend
 		if err != nil {
 			logger.Errorf("error retrieving stake pools stats %v ", err)
 		}
@@ -72,7 +72,7 @@ func getPoolInfo() {
 		}
 	}
 
-	err := DB.Select(&stakePools, `
+	err := ReaderDb.Select(&stakePools, `
 		select ENCODE(from_address::bytea, 'hex') as address, count(*) as vcount
 		from (
 			select publickey, from_address
@@ -93,7 +93,7 @@ func getPoolInfo() {
 	for _, pool := range stakePools {
 		// li := time.Now()
 		var stats []PoolStatsData
-		err := DB.Select(&stats,
+		err := ReaderDb.Select(&stats,
 			`SELECT status, validatorindex, balance31d
 			 FROM validators 
 			 WHERE pubkey = ANY(
@@ -109,7 +109,7 @@ func getPoolInfo() {
 		// st := time.Now().Sub(li).Seconds()
 		if len(stats) > 0 {
 			pName := ""
-			if utils.Config.Chain.Network == "mainnet" || utils.Config.Chain.Network == "prater" {
+			if utils.Config.Chain.Config.ConfigName == "mainnet" || utils.Config.Chain.Config.ConfigName == "prater" {
 				nPool, exist := addrName[pool.Address]
 				if exist {
 					pName = nPool.Name
@@ -131,7 +131,7 @@ func getPoolIncome(poolAddress string, poolName string) {
 	// 	indexes[i] = validator.ValidatorIndex
 	// }
 	var indexes []uint64
-	err := DB.Select(&indexes,
+	err := ReaderDb.Select(&indexes,
 		`SELECT validatorindex
 		 FROM validators 
 		 WHERE pubkey = ANY(
@@ -173,7 +173,7 @@ func getValidatorEarnings(validators []uint64, poolName string) {
 
 	balances := []*types.Validator{}
 
-	err := DB.Select(&balances, `SELECT 
+	err := ReaderDb.Select(&balances, `SELECT 
 			   validatorindex,
 			   COALESCE(balance, 0) AS balance, 
 			   COALESCE(balanceactivation, 0) AS balanceactivation, 
@@ -195,7 +195,7 @@ func getValidatorEarnings(validators []uint64, poolName string) {
 		Publickey []byte
 	}{}
 
-	err = DB.Select(&deposits, `
+	err = ReaderDb.Select(&deposits, `
 	SELECT block_slot / 32 AS epoch, amount, publickey 
 	FROM blocks_deposits 
 	WHERE publickey IN (
@@ -246,8 +246,8 @@ func getValidatorEarnings(validators []uint64, poolName string) {
 		}
 
 		if int64(balance.ActivationEpoch) <= lastMonthEpoch && balance.Status == "active_online" {
-			earningsInPeriod += (int64(balance.Balance) - int64(balance.Balance31d)) - (int64(balance.Balance) - int64(balance.Balance7d))
-			earningsInPeriodBalance += int64(balance.BalanceActivation)
+			earningsInPeriod += (int64(balance.Balance) - balance.Balance31d.Int64) - (int64(balance.Balance) - balance.Balance7d.Int64)
+			earningsInPeriodBalance += balance.BalanceActivation.Int64
 		}
 	}
 
@@ -258,7 +258,7 @@ func updateChartDB(poolName string, epoch int64, income int64, balance int64) {
 	if poolName == "" {
 		return
 	}
-	_, err := DB.Exec(`
+	_, err := WriterDb.Exec(`
 		INSERT INTO staking_pools_chart
 		(epoch, name, income, balance)
 		VALUES
@@ -272,7 +272,7 @@ func updateChartDB(poolName string, epoch int64, income int64, balance int64) {
 func deleteOldChartEntries() {
 	latestEpoch := int64(latestEpoch)
 	sixMonthsOld := latestEpoch - 225*31*6
-	_, err := DB.Exec(`
+	_, err := WriterDb.Exec(`
 		DELETE FROM staking_pools_chart
 		WHERE epoch <= $1
 	`, sixMonthsOld)

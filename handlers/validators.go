@@ -4,74 +4,89 @@ import (
 	"encoding/json"
 	"eth2-exporter/db"
 	"eth2-exporter/price"
-	"eth2-exporter/services"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
 	"html"
-	"html/template"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
 )
 
-var validatorsTemplate = template.Must(template.New("validators").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/validators.html"))
+type states struct {
+	Name  string `db:"statename"`
+	Count uint64 `db:"statecount"`
+}
 
 // Validators returns the validators using a go template
 func Validators(w http.ResponseWriter, r *http.Request) {
+	var validatorsTemplate = templates.GetTemplate("layout.html", "validators.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
 	validatorsPageData := types.ValidatorsPageData{}
-	var validators []*types.ValidatorsPageDataValidators
+	validatorsPageData.PendingCount = 0
+	validatorsPageData.ActiveOnlineCount = 0
+	validatorsPageData.ActiveOfflineCount = 0
+	validatorsPageData.ActiveCount = 0
+	validatorsPageData.SlashingOnlineCount = 0
+	validatorsPageData.SlashingOfflineCount = 0
+	validatorsPageData.SlashingCount = 0
+	validatorsPageData.ExitingOnlineCount = 0
+	validatorsPageData.ExitingOfflineCount = 0
+	validatorsPageData.ExitedCount = 0
+	validatorsPageData.VoluntaryExitsCount = 0
+	validatorsPageData.DepositedCount = 0
 
-	err := db.DB.Select(&validators, `SELECT activationepoch, exitepoch, lastattestationslot, slashed FROM validators ORDER BY validatorindex`)
+	var currentStateCounts []*states
 
+	qry := "SELECT status AS statename, COUNT(*) AS statecount FROM validators GROUP BY status"
+	err := db.ReaderDb.Select(&currentStateCounts, qry)
 	if err != nil {
 		logger.Errorf("error retrieving validators data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
-	latestEpoch := services.LatestEpoch()
-
-	validatorOnlineThresholdSlot := GetValidatorOnlineThresholdSlot()
-	for _, validator := range validators {
-		validatorsPageData.TotalCount++
-		if latestEpoch > validator.ExitEpoch {
-			validatorsPageData.ExitedCount++
-		} else if latestEpoch < validator.ActivationEpoch {
-			validatorsPageData.PendingCount++
-		} else if validator.Slashed {
-			// offline validators did not attest in the last 2 epochs (and are active for >1 epochs)
-			if validator.ActivationEpoch < latestEpoch && (validator.LastAttestationSlot == nil || uint64(*validator.LastAttestationSlot) < validatorOnlineThresholdSlot) {
-				validatorsPageData.SlashingOfflineCount++
-			} else {
-				validatorsPageData.SlashingOnlineCount++
-			}
-		} else {
-			// offline validators did not attest in the last 2 epochs (and are active for >1 epochs)
-			if validator.ActivationEpoch < latestEpoch && (validator.LastAttestationSlot == nil || uint64(*validator.LastAttestationSlot) < validatorOnlineThresholdSlot) {
-				validatorsPageData.ActiveOfflineCount++
-			} else {
-				validatorsPageData.ActiveOnlineCount++
-			}
+	for _, state := range currentStateCounts {
+		switch state.Name {
+		case "pending":
+			validatorsPageData.PendingCount = state.Count
+		case "active_online":
+			validatorsPageData.ActiveOnlineCount = state.Count
+		case "active_offline":
+			validatorsPageData.ActiveOfflineCount = state.Count
+		case "slashing_online":
+			validatorsPageData.SlashingOnlineCount = state.Count
+		case "slashing_offline":
+			validatorsPageData.SlashingOfflineCount = state.Count
+		case "slashed":
+			validatorsPageData.Slashed = state.Count
+		case "exiting_online":
+			validatorsPageData.ExitingOnlineCount = state.Count
+		case "exiting_offline":
+			validatorsPageData.ExitingOfflineCount = state.Count
+		case "exited":
+			validatorsPageData.VoluntaryExitsCount = state.Count
+		case "deposited":
+			validatorsPageData.DepositedCount = state.Count
 		}
 	}
+
 	validatorsPageData.ActiveCount = validatorsPageData.ActiveOnlineCount + validatorsPageData.ActiveOfflineCount
 	validatorsPageData.SlashingCount = validatorsPageData.SlashingOnlineCount + validatorsPageData.SlashingOfflineCount
 	validatorsPageData.ExitingCount = validatorsPageData.ExitingOnlineCount + validatorsPageData.ExitingOfflineCount
+	validatorsPageData.ExitedCount = validatorsPageData.VoluntaryExitsCount + validatorsPageData.Slashed
+	validatorsPageData.TotalCount = validatorsPageData.ActiveCount + validatorsPageData.ExitingCount + validatorsPageData.ExitedCount + validatorsPageData.PendingCount + validatorsPageData.DepositedCount
 
 	data := InitPageData(w, r, "validators", "/validators", "Validators")
 	data.HeaderAd = true
 	data.Data = validatorsPageData
 
-	err = validatorsTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, validatorsTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -99,9 +114,14 @@ func parseValidatorsDataQueryParams(r *http.Request) (*ValidatorsDataQueryParams
 		search = search[:128]
 	}
 	var searchIndex *uint64
-	index, err := strconv.ParseUint(search, 10, 64)
-	if err == nil {
+	if search == "" {
+		index := uint64(0)
 		searchIndex = &index
+	} else {
+		index, err := strconv.ParseUint(search, 10, 64)
+		if err == nil {
+			searchIndex = &index
+		}
 	}
 
 	var searchPubkeyExact *string
@@ -118,29 +138,33 @@ func parseValidatorsDataQueryParams(r *http.Request) (*ValidatorsDataQueryParams
 	var qryStateFilter string
 	switch filterByState {
 	case "pending":
-		qryStateFilter = "AND validators.status LIKE 'pending%'"
+		qryStateFilter = "WHERE validators.status = 'pending'"
 	case "active":
-		qryStateFilter = "AND validators.status LIKE 'active%'"
+		qryStateFilter = "WHERE validators.status LIKE 'active%'"
 	case "active_online":
-		qryStateFilter = "AND validators.status = 'active_online'"
+		qryStateFilter = "WHERE validators.status = 'active_online'"
 	case "active_offline":
-		qryStateFilter = "AND validators.status = 'active_offline'"
+		qryStateFilter = "WHERE validators.status = 'active_offline'"
 	case "slashing":
-		qryStateFilter = "AND validators.status LIKE 'slashing%'"
+		qryStateFilter = "WHERE validators.status LIKE 'slashing%'"
 	case "slashing_online":
-		qryStateFilter = "AND validators.status = 'slashing_online'"
+		qryStateFilter = "WHERE validators.status = 'slashing_online'"
 	case "slashing_offline":
-		qryStateFilter = "AND validators.status = 'slashing_offline'"
+		qryStateFilter = "WHERE validators.status = 'slashing_offline'"
 	case "slashed":
-		qryStateFilter = "AND validators.status = 'slashed'"
+		qryStateFilter = "WHERE validators.status = 'slashed'"
 	case "exiting":
-		qryStateFilter = "AND validators.status LIKE 'exiting%'"
+		qryStateFilter = "WHERE validators.status LIKE 'exiting%'"
 	case "exiting_online":
-		qryStateFilter = "AND validators.status = 'exiting_online'"
+		qryStateFilter = "WHERE validators.status = 'exiting_online'"
 	case "exiting_offline":
-		qryStateFilter = "AND validators.status = 'exiting_offline'"
+		qryStateFilter = "WHERE validators.status = 'exiting_offline'"
 	case "exited":
-		qryStateFilter = "AND (validators.status = 'exited' OR validators.status = 'slashed')"
+		qryStateFilter = "WHERE (validators.status = 'exited' OR validators.status = 'slashed')"
+	case "voluntary":
+		qryStateFilter = "WHERE validators.status = 'exited'"
+	case "deposited":
+		qryStateFilter = "WHERE validators.status = 'deposited'"
 	default:
 		qryStateFilter = ""
 	}
@@ -219,29 +243,20 @@ func parseValidatorsDataQueryParams(r *http.Request) (*ValidatorsDataQueryParams
 func ValidatorsData(w http.ResponseWriter, r *http.Request) {
 	currency := GetCurrency(r)
 
-	stats := services.GetLatestStats()
-
 	w.Header().Set("Content-Type", "application/json")
 
 	dataQuery, err := parseValidatorsDataQueryParams(r)
 	if err != nil {
 		logger.Errorf("error parsing query-data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
-	}
-
-	var totalCount uint64
-	var filteredCount uint64
-
-	if stats.TotalValidatorCount != nil {
-		totalCount = *stats.TotalValidatorCount
 	}
 
 	var validators []*types.ValidatorsPageDataValidators
 	qry := ""
-	if dataQuery.Search == "" && dataQuery.StateFilter == "" {
-		filteredCount = totalCount
-		qry = fmt.Sprintf(`
+	isAll := bool(false)
+	// if dataQuery.Search == "" && dataQuery.StateFilter == "" {
+	qry = fmt.Sprintf(`
 			SELECT
 				validators.validatorindex,
 				validators.pubkey,
@@ -258,64 +273,99 @@ func ValidatorsData(w http.ResponseWriter, r *http.Request) {
 			LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
 			ORDER BY %s %s
 			LIMIT $1 OFFSET $2`, dataQuery.OrderBy, dataQuery.OrderDir)
-		err = db.DB.Select(&validators, qry, dataQuery.Length, dataQuery.Start)
-		if err != nil {
-			logger.Errorf("error retrieving validators data: %v", err)
-			http.Error(w, "Internal server error", 503)
-			return
-		}
-	} else {
-		// for perfomance-reasons we combine multiple search results with `union`
-		args := []interface{}{}
-		args = append(args, "%"+strings.ToLower(dataQuery.Search)+"%")
-		searchQry := fmt.Sprintf(`SELECT publickey AS pubkey FROM validator_names WHERE LOWER(name) LIKE $%d `, len(args))
-		if dataQuery.SearchIndex != nil {
-			args = append(args, *dataQuery.SearchIndex)
-			searchQry += fmt.Sprintf(`UNION SELECT pubkey FROM validators WHERE validatorindex = $%d `, len(args))
-		}
-		if dataQuery.SearchPubkeyExact != nil {
-			args = append(args, *dataQuery.SearchPubkeyExact)
-			searchQry += fmt.Sprintf(`UNION SELECT pubkey FROM validators WHERE pubkeyhex = $%d `, len(args))
-		} else if dataQuery.SearchPubkeyLike != nil {
-			args = append(args, *dataQuery.SearchPubkeyLike+"%")
-			searchQry += fmt.Sprintf(`UNION SELECT pubkey FROM validators WHERE pubkeyhex LIKE $%d `, len(args))
-		}
-		args = append(args, dataQuery.Length)
-		args = append(args, dataQuery.Start)
-		qry = fmt.Sprintf(`
-			WITH matched_validators AS (%v)
-			SELECT
-				validators.validatorindex,
-				validators.pubkey,
-				validators.withdrawableepoch,
-				validators.balance,
-				validators.effectivebalance,
-				validators.slashed,
-				validators.activationepoch,
-				validators.exitepoch,
-				validators.lastattestationslot,
-				COALESCE(validator_names.name, '') AS name,
-				validators.status AS state,
-				COALESCE(cnt.total_count, 0) as total_count
-			FROM validators
-			INNER JOIN matched_validators ON validators.pubkey = matched_validators.pubkey
-			LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-			LEFT JOIN (select count(*) from matched_validators) cnt(total_count) ON true
-			%s
-			ORDER BY %s %s
-			LIMIT $%d OFFSET $%d`, searchQry, dataQuery.StateFilter, dataQuery.OrderBy, dataQuery.OrderDir, len(args)-1, len(args))
-		err = db.DB.Select(&validators, qry, args...)
-		if err != nil {
-			logger.Errorf("error retrieving validators data (with search): %v", err)
-			http.Error(w, "Internal server error", 503)
-			return
-		}
 
-		filteredCount = 0
-		if len(validators) > 0 {
-			filteredCount = validators[0].TotalCount
-		}
+	err = db.ReaderDb.Select(&validators, qry, dataQuery.Length, dataQuery.Start)
+	if err != nil {
+		logger.Errorf("error retrieving validators data: %v", err)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		return
 	}
+	isAll = true
+	// } else {
+	// 	// for performance-reasons we combine multiple search results with `union`
+	// 	args := []interface{}{}
+	// 	searchQry := ""
+	// 	countWhere := ""
+
+	// 	if dataQuery.Search != "" {
+	// 		args = append(args, "%"+strings.ToLower(dataQuery.Search)+"%")
+	// 		countWhere += fmt.Sprintf(`LOWER(validator_names.name) LIKE $%d`, len(args))
+	// 		searchQry += `SELECT publickey AS pubkey FROM validator_names WHERE ` + countWhere
+	// 	} else {
+	// 		if searchQry != "" {
+	// 			searchQry += " UNION "
+	// 		}
+	// 		searchQry += "SELECT pubkey FROM validators"
+	// 	}
+	// 	if dataQuery.SearchIndex != nil && *dataQuery.SearchIndex != 0 {
+	// 		if searchQry != "" {
+	// 			searchQry += " UNION "
+	// 		}
+	// 		args = append(args, *dataQuery.SearchIndex)
+	// 		searchQry += fmt.Sprintf(`SELECT pubkey FROM validators WHERE validatorindex = $%d`, len(args))
+	// 	}
+	// 	if dataQuery.SearchPubkeyExact != nil {
+	// 		if searchQry != "" {
+	// 			searchQry += " UNION "
+	// 		}
+	// 		args = append(args, *dataQuery.SearchPubkeyExact)
+	// 		searchQry += fmt.Sprintf(`SELECT pubkey FROM validators WHERE pubkeyhex = $%d`, len(args))
+	// 	} else if dataQuery.SearchPubkeyLike != nil {
+	// 		if searchQry != "" {
+	// 			searchQry += " UNION "
+	// 		}
+	// 		args = append(args, *dataQuery.SearchPubkeyLike+"%")
+	// 		searchQry += fmt.Sprintf(`SELECT pubkey FROM validators WHERE pubkeyhex LIKE $%d`, len(args))
+	// 	}
+
+	// 	args = append(args, dataQuery.Length)
+	// 	args = append(args, dataQuery.Start)
+
+	// 	if searchQry == "" {
+	// 		logger.Errorf("error sql statement incomplete (without with statement)")
+	// 		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+	// 		return
+	// 	}
+
+	// 	addAnd := ""
+	// 	if countWhere != "" {
+	// 		addAnd = "AND"
+	// 	}
+	// 	qry = fmt.Sprintf(`
+	// 		WITH matched_validators AS (%s)
+	// 		SELECT
+	// 				validators.validatorindex,
+	// 				validators.pubkey,
+	// 				validators.withdrawableepoch,
+	// 				validators.balance,
+	// 				validators.effectivebalance,
+	// 				validators.slashed,
+	// 				validators.activationepoch,
+	// 				validators.exitepoch,
+	// 				validators.lastattestationslot,
+	// 				COALESCE(validator_names.name, '') AS name,
+	// 				validators.status AS state,
+	// 				COALESCE(cnt.total_count, 0) as total_count
+	// 		FROM validators
+	// 		LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
+	// 		LEFT JOIN (SELECT MAX(validatorindex) + 1
+	// 					FROM validators
+	// 					LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
+	// 					%s %s
+	// 					%s) cnt(total_count) ON true
+
+	// 					WHERE validators.pubkey IN (SELECT pubkey FROM matched_validators)
+	// 					%s
+	// 		ORDER BY %s %s
+	// 		LIMIT $%d OFFSET $%d`, searchQry, dataQuery.StateFilter, addAnd, countWhere, dataQuery.StateFilter, dataQuery.OrderBy, dataQuery.OrderDir, len(args)-1, len(args))
+
+	// 	err = db.ReaderDb.Select(&validators, qry, args...)
+	// 	if err != nil {
+	// 		logger.Errorf("error retrieving validators data (with search): %v", err)
+	// 		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+	// 		return
+	// 	}
+	// }
 
 	tableData := make([][]interface{}, len(validators))
 	for i, v := range validators {
@@ -365,17 +415,33 @@ func ValidatorsData(w http.ResponseWriter, r *http.Request) {
 		tableData[i] = append(tableData[i], html.EscapeString(v.Name))
 	}
 
+	countTotal := uint64(0)
+	qry = "SELECT MAX(validatorindex) + 1 as total FROM validators"
+	err = db.ReaderDb.Get(&countTotal, qry)
+	if err != nil {
+		logger.Errorf("error retrieving validators total count: %v", err)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		return
+	}
+
 	data := &types.DataTableResponse{
 		Draw:            dataQuery.Draw,
-		RecordsTotal:    totalCount,
-		RecordsFiltered: filteredCount,
+		RecordsTotal:    countTotal,
+		RecordsFiltered: countTotal,
 		Data:            tableData,
+	}
+
+	if !isAll && validators != nil {
+		data.RecordsFiltered = validators[0].TotalCount
+	}
+	if validators == nil {
+		data.RecordsFiltered = 0
 	}
 
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 }

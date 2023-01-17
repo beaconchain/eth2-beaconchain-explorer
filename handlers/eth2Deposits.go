@@ -3,30 +3,26 @@ package handlers
 import (
 	"encoding/json"
 	"eth2-exporter/db"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
-	"html/template"
 	"net/http"
 	"strconv"
 	"strings"
 )
 
-var eth2DepositsTemplate = template.Must(template.New("eth2Deposits").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/eth2Deposits.html"))
-
 // Eth2Deposits will return information about deposits using a go template
 func Eth2Deposits(w http.ResponseWriter, r *http.Request) {
 
+	var eth2DepositsTemplate = templates.GetTemplate("layout.html", "eth2Deposits.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
-	data := InitPageData(w, r, "eth2Deposits", "/deposits/eth2", "Eth2 Deposits")
+	data := InitPageData(w, r, "eth2Deposits", "/deposits/eth2", "Included Deposits")
 	data.HeaderAd = true
 
-	err := eth2DepositsTemplate.ExecuteTemplate(w, "layout", data)
-
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, eth2DepositsTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -43,19 +39,19 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 	draw, err := strconv.ParseUint(q.Get("draw"), 10, 64)
 	if err != nil {
 		logger.Errorf("error converting datatables data parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	start, err := strconv.ParseUint(q.Get("start"), 10, 64)
 	if err != nil {
 		logger.Errorf("error converting datatables start parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	length, err := strconv.ParseUint(q.Get("length"), 10, 64)
 	if err != nil {
 		logger.Errorf("error converting datatables length parameter from string to int: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	if length > 100 {
@@ -81,14 +77,14 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 	depositCount, err := db.GetEth2DepositsCount(search)
 	if err != nil {
 		logger.Errorf("error retrieving eth2_deposit count: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
 	deposits, err := db.GetEth2Deposits(search, length, start, orderBy, orderDir)
 	if err != nil {
 		logger.Errorf("error retrieving eth2_deposit data: %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 
@@ -115,7 +111,7 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 }

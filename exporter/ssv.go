@@ -90,12 +90,10 @@ func exportSSV() error {
 			return nil
 		}
 	}
-
-	return nil
 }
 
 func saveSSV(res *SSVExporterResponse) error {
-	tx, err := db.DB.Beginx()
+	tx, err := db.WriterDb.Beginx()
 	if err != nil {
 		return err
 	}
@@ -135,8 +133,7 @@ func saveSSV(res *SSVExporterResponse) error {
 			}
 			valueArgs = append(valueArgs, pubkey)
 		}
-		stmt := fmt.Sprintf(`insert into validator_tags (publickey, tag) values %s on conflict (publickey, tag) do nothing`, strings.Join(valueStrings, ","))
-		_, err := tx.Exec(stmt, valueArgs...)
+		_, err := tx.Exec(fmt.Sprintf(`insert into validator_tags (publickey, tag) values %s on conflict (publickey, tag) do nothing`, strings.Join(valueStrings, ",")), valueArgs...)
 		if err != nil {
 			return err
 		}

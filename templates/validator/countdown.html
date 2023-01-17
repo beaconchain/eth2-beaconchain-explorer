@@ -10,7 +10,7 @@
 		}
 
 		if (second < 10) {
-			second = '0'+ second 
+			second = '0'+ second
 		}
 		if (min < 10) {
 			min = '0' + min
@@ -21,12 +21,16 @@
 		if (days < 10) {
 			days = '0' + days
 		}
-		
+
 		$('#clock').html(days+' days '+hour + ' hr ' + min + ' min ' + second + ' sec')
 	}
 
 	document.addEventListener('DOMContentLoaded', function() {
-		var genesis = {{.ActivationTs.Unix}}
+		{{ if not .EstimatedActivationTs.IsZero}}
+			var genesis = {{ .EstimatedActivationTs.Unix }}
+		{{ else }}
+			var genesis = {{ .ActivationTs.Unix }}
+		{{ end }}
 		var now = Math.round((new Date()).getTime() / 1000)
 		var secondsLeft = genesis - now
 		var seconds = secondsLeft % 60
@@ -58,20 +62,19 @@
 			}
 
 			seconds -= 1
-			
+
 			setTime(days, hour, min, seconds)
 		}, 1000)
 	})
 </script>
-<div class="position-relative d-flex justify-content-center">
-	{{template "rocket"}}
-	<div style="max-width: 300px;" id="countdown" class="d-flex flex-column justify-content-center">
-		<div class="align-self-center text-center">
-			<div>
-				<strong id="clock">
-				</strong>
-			</div>
-		</div>
-	</div>
-</div>
-{{end}}
+  <div class="position-relative d-flex justify-content-center">
+    {{ template "rocket" }}
+    <div style="max-width: 300px;" id="countdown" class="d-flex flex-column justify-content-center">
+      <div class="align-self-center text-center">
+        <div>
+          <strong id="clock"> </strong>
+        </div>
+      </div>
+    </div>
+  </div>
+{{ end }}

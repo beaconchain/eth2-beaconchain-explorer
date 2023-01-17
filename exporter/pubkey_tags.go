@@ -11,7 +11,7 @@ func UpdatePubkeyTag() {
 	for true {
 		start := time.Now()
 
-		tx, err := db.DB.Beginx()
+		tx, err := db.WriterDb.Beginx()
 		if err != nil {
 			logger.WithError(err).Error("Error connecting to DB")
 			// return err
@@ -29,7 +29,7 @@ func UpdatePubkeyTag() {
 
 		err = tx.Commit()
 		if err != nil {
-			logger.WithError(err).Error("Error commiting transaction")
+			logger.WithError(err).Error("Error committing transaction")
 		}
 		tx.Rollback()
 

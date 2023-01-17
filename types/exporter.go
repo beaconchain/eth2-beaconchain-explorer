@@ -1,7 +1,16 @@
 package types
 
 import (
-	ethpb "github.com/prysmaticlabs/prysm/proto/prysm/v1alpha1"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"math/big"
+
+	"github.com/jackc/pgtype"
+	"github.com/pkg/errors"
+	ethpb "github.com/prysmaticlabs/prysm/v3/proto/prysm/v1alpha1"
+	"github.com/shopspring/decimal"
+	"github.com/sirupsen/logrus"
 )
 
 // ChainHead is a struct to hold chain head data
@@ -47,7 +56,6 @@ type EpochData struct {
 // ValidatorParticipation is a struct to hold validator participation data
 type ValidatorParticipation struct {
 	Epoch                   uint64
-	Finalized               bool
 	GlobalParticipationRate float32
 	VotedEther              uint64
 	EligibleEther           uint64
@@ -62,6 +70,7 @@ type BeaconCommitteItem struct {
 type Validator struct {
 	Index                      uint64 `db:"validatorindex"`
 	PublicKey                  []byte `db:"pubkey"`
+	PublicKeyHex               string `db:"pubkeyhex"`
 	Balance                    uint64 `db:"balance"`
 	EffectiveBalance           uint64 `db:"effectivebalance"`
 	Slashed                    bool   `db:"slashed"`
@@ -71,14 +80,14 @@ type Validator struct {
 	WithdrawableEpoch          uint64 `db:"withdrawableepoch"`
 	WithdrawalCredentials      []byte `db:"withdrawalcredentials"`
 
-	BalanceActivation uint64 `db:"balanceactivation"`
-	Balance1d         uint64 `db:"balance1d"`
-	Balance7d         uint64 `db:"balance7d"`
-	Balance31d        uint64 `db:"balance31d"`
-	Status            string `db:"status"`
+	BalanceActivation sql.NullInt64 `db:"balanceactivation"`
+	Balance1d         sql.NullInt64 `db:"balance1d"`
+	Balance7d         sql.NullInt64 `db:"balance7d"`
+	Balance31d        sql.NullInt64 `db:"balance31d"`
+	Status            string        `db:"status"`
 
-	LastAttestationSlot uint64 `db:"lastattestationslot"`
-	LastProposalSlot    uint64 `db:"lastproposalslot"`
+	LastAttestationSlot sql.NullInt64 `db:"lastattestationslot"`
+	LastProposalSlot    sql.NullInt64 `db:"lastproposalslot"`
 }
 
 // ValidatorQueue is a struct to hold validator queue data
@@ -112,8 +121,44 @@ type Block struct {
 	Attestations      []*Attestation
 	Deposits          []*Deposit
 	VoluntaryExits    []*VoluntaryExit
-	SyncAggregate     *SyncAggregate // warning: sync aggregate may be nil, for phase0 blocks
+	SyncAggregate     *SyncAggregate    // warning: sync aggregate may be nil, for phase0 blocks
+	ExecutionPayload  *ExecutionPayload // warning: payload may be nil, for phase0/altair blocks
 	Canonical         bool
+}
+
+type Transaction struct {
+	Raw []byte
+	// Note: below values may be nil/0 if Raw fails to decode into a valid transaction
+	TxHash       []byte
+	AccountNonce uint64
+	// big endian
+	Price     []byte
+	GasLimit  uint64
+	Sender    []byte
+	Recipient []byte
+	// big endian
+	Amount  []byte
+	Payload []byte
+
+	MaxPriorityFeePerGas uint64
+	MaxFeePerGas         uint64
+}
+
+type ExecutionPayload struct {
+	ParentHash    []byte
+	FeeRecipient  []byte
+	StateRoot     []byte
+	ReceiptsRoot  []byte
+	LogsBloom     []byte
+	Random        []byte
+	BlockNumber   uint64
+	GasLimit      uint64
+	GasUsed       uint64
+	Timestamp     uint64
+	ExtraData     []byte
+	BaseFeePerGas uint64
+	BlockHash     []byte
+	Transactions  []*Transaction
 }
 
 // Eth1Data is a struct to hold the ETH1 data
@@ -247,6 +292,21 @@ type Eth2Deposit struct {
 	Withdrawalcredentials []byte `db:"withdrawalcredentials"`
 	Amount                uint64 `db:"amount"`
 	Signature             []byte `db:"signature"`
+}
+
+// EthStoreDay is a struct to hold performance data for a specific beaconchain-day.
+// All fields use Gwei unless specified otherwise by the field name
+type EthStoreDay struct {
+	Pool                   string          `db:"pool"`
+	Day                    uint64          `db:"day"`
+	EffectiveBalancesSum   decimal.Decimal `db:"effective_balances_sum_wei"`
+	StartBalancesSum       decimal.Decimal `db:"start_balances_sum_wei"`
+	EndBalancesSum         decimal.Decimal `db:"end_balances_sum_wei"`
+	DepositsSum            decimal.Decimal `db:"deposits_sum_wei"`
+	TxFeesSumWei           decimal.Decimal `db:"tx_fees_sum_wei"`
+	ConsensusRewardsSumWei decimal.Decimal `db:"consensus_rewards_sum_wei"`
+	TotalRewardsWei        decimal.Decimal `db:"total_rewards_wei"`
+	APR                    decimal.Decimal `db:"apr"`
 }
 
 type HistoricEthPrice struct {
@@ -413,4 +473,119 @@ type HistoricEthPrice struct {
 	} `json:"market_data"`
 	Name   string `json:"name"`
 	Symbol string `json:"symbol"`
+}
+
+type Relay struct {
+	ID          string         `db:"tag_id"`
+	Endpoint    string         `db:"endpoint"`
+	Link        sql.NullString `db:"public_link"`
+	IsCensoring sql.NullBool   `db:"is_censoring"`
+	IsEthical   sql.NullBool   `db:"is_ethical"`
+	Name        string         `db:"name"`
+	Logger      logrus.Entry
+}
+
+type RelayBlock struct {
+	ID                   string `db:"tag_id" json:"tag_id"`
+	BlockSlot            uint64 `db:"block_slot" json:"block_slot"`
+	BlockRoot            string `db:"block_root" json:"block_root"`
+	ExecBlockHash        string `db:"exec_block_hash"`
+	Value                uint64 `db:"value" json:"value"`
+	BuilderPubkey        string `db:"builder_pubkey" json:"builder_pubkey"`
+	ProposerPubkey       string `db:"proposer_pubkey" json:"proposer_pubkey"`
+	ProposerFeeRecipient string `db:"proposer_fee_recipient" json:"proposer_fee_recipient"`
+}
+
+type RelayBlockSlice []RelayBlock
+
+func (s *RelayBlockSlice) Scan(src interface{}) error {
+	switch v := src.(type) {
+	case []byte:
+		err := json.Unmarshal(v, s)
+		if err != nil {
+			return err
+		}
+		// if no tags were found we will get back an empty struct, we don't want that
+		if len(*s) == 1 && (*s)[0].ID == "" {
+			*s = nil
+		}
+		return nil
+	case string:
+		return json.Unmarshal([]byte(v), s)
+	}
+	return errors.New("type assertion failed")
+}
+
+type BlockTag struct {
+	ID        string `db:"tag_id"`
+	BlockSlot uint64 `db:"slot"`
+	BlockRoot string `db:"blockroot"`
+}
+
+type TagMetadata struct {
+	Name        string `json:"name"`
+	Summary     string `json:"summary"`
+	PublicLink  string `json:"public_url"`
+	Description string `json:"description"`
+	Color       string `json:"color"`
+}
+
+type TagMetadataSlice []TagMetadata
+
+func (s *TagMetadataSlice) Scan(src interface{}) error {
+	switch v := src.(type) {
+	case []byte:
+		err := json.Unmarshal(v, s)
+		if err != nil {
+			return err
+		}
+		// if no tags were found we will get back an empty TagMetadata, we don't want that
+		if len(*s) == 1 && (*s)[0].Name == "" {
+			*s = nil
+		}
+		return nil
+	case string:
+		return json.Unmarshal([]byte(v), s)
+	}
+	return errors.New("type assertion failed")
+}
+
+type WeiString struct {
+	pgtype.Numeric
+}
+
+func (b WeiString) MarshalJSON() ([]byte, error) {
+	return []byte("\"" + b.BigInt().String() + "\""), nil
+}
+
+func (b *WeiString) UnmarshalJSON(p []byte) error {
+	if string(p) == "null" {
+		return nil
+	}
+	if p[0] == byte('"') {
+		p = p[1 : len(p)-1]
+	}
+	err := b.Set(string(p))
+	if err != nil {
+		return fmt.Errorf("failed to unmarshal WeiString: %v", err)
+	}
+	return nil
+}
+
+func (b *WeiString) BigInt() *big.Int {
+	// this is stupid
+
+	if b.Exp == 0 {
+		return b.Int
+	}
+	if b.Exp < 0 {
+		return b.Int
+	}
+
+	num := &big.Int{}
+	num.Set(b.Int)
+	mul := &big.Int{}
+	mul.Exp(big.NewInt(10), big.NewInt(int64(b.Exp)), nil)
+	num.Mul(num, mul)
+	return num
 }

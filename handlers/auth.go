@@ -5,24 +5,19 @@ import (
 	"errors"
 	"eth2-exporter/db"
 	"eth2-exporter/mail"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
+	"strings"
 	"time"
 
-	"html/template"
 	"net/http"
 
 	"github.com/gorilla/csrf"
 	"github.com/gorilla/mux"
 	"golang.org/x/crypto/bcrypt"
 )
-
-var loginTemplate = template.Must(template.New("login").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/login.html"))
-var registerTemplate = template.Must(template.New("register").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/register.html"))
-var resetPasswordTemplate = template.Must(template.New("resetPassword").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/resetPassword.html"))
-var resendConfirmationTemplate = template.Must(template.New("resetPassword").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/resendConfirmation.html"))
-var requestResetPaswordTemplate = template.Must(template.New("resetPassword").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/requestResetPassword.html"))
 
 var authSessionName = "auth"
 var authResetEmailRateLimit = time.Second * 60 * 2
@@ -31,16 +26,16 @@ var authInternalServerErrorFlashMsg = "Error: Something went wrong :( Please ret
 
 // Register handler renders a template that allows for the creation of a new user.
 func Register(w http.ResponseWriter, r *http.Request) {
+	var registerTemplate = templates.GetTemplate("layout.html", "register.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
 	data := InitPageData(w, r, "register", "/register", "Register new account")
 	data.Data = types.AuthData{Flashes: utils.GetFlashes(w, r, authSessionName), CsrfField: csrf.TemplateField(r)}
 	data.Meta.NoTrack = true
 
-	err := registerTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if handleTemplateError(w, r, registerTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -62,6 +57,7 @@ func RegisterPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := r.FormValue("email")
+	email = strings.ToLower(email)
 	pwd := r.FormValue("password")
 
 	if !utils.IsValidEmail(email) {
@@ -71,7 +67,7 @@ func RegisterPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tx, err := db.FrontendDB.Beginx()
+	tx, err := db.FrontendWriterDB.Beginx()
 	if err != nil {
 		logger.Errorf("error creating db-tx for registering user: %v", err)
 		session.AddFlash(authInternalServerErrorFlashMsg)
@@ -82,9 +78,16 @@ func RegisterPost(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 
 	var existingEmails int
-	err = tx.Get(&existingEmails, "SELECT COUNT(*) FROM users WHERE email = $1", email)
+	err = tx.Get(&existingEmails, "SELECT COUNT(*) FROM users WHERE LOWER(email) = $1", email)
 	if existingEmails > 0 {
 		session.AddFlash("Error: Email already exists!")
+		session.Save(r, w)
+		http.Redirect(w, r, "/register", http.StatusSeeOther)
+		return
+	}
+	if err != nil {
+		logger.Errorf("error retrieving existing emails: %v", err)
+		session.AddFlash(authInternalServerErrorFlashMsg)
 		session.Save(r, w)
 		http.Redirect(w, r, "/register", http.StatusSeeOther)
 		return
@@ -126,7 +129,7 @@ func RegisterPost(w http.ResponseWriter, r *http.Request) {
 
 	err = tx.Commit()
 	if err != nil {
-		logger.Errorf("error commiting db-tx when registering user: %v", err)
+		logger.Errorf("error committing db-tx when registering user: %v", err)
 		session.AddFlash(authInternalServerErrorFlashMsg)
 		session.Save(r, w)
 		http.Redirect(w, r, "/register", http.StatusSeeOther)
@@ -148,16 +151,17 @@ func RegisterPost(w http.ResponseWriter, r *http.Request) {
 
 // Login handler renders a template that allows a user to login.
 func Login(w http.ResponseWriter, r *http.Request) {
+
+	var loginTemplate = templates.GetTemplate("layout.html", "login.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
 	data := InitPageData(w, r, "login", "/login", "Login")
 	data.Data = types.AuthData{Flashes: utils.GetFlashes(w, r, authSessionName), CsrfField: csrf.TemplateField(r)}
 	data.Meta.NoTrack = true
 
-	err := loginTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if handleTemplateError(w, r, loginTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -178,6 +182,7 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := r.FormValue("email")
+	email = strings.ToLower(email)
 	pwd := r.FormValue("password")
 
 	user := struct {
@@ -189,7 +194,7 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 		Active    bool   `db:"active"`
 	}{}
 
-	err = db.FrontendDB.Get(&user, "SELECT users.id, email, password, email_confirmed, COALESCE(product_id, '') as product_id, COALESCE(active, false) as active FROM users left join users_app_subscriptions on users_app_subscriptions.user_id = users.id WHERE email = $1", email)
+	err = db.FrontendWriterDB.Get(&user, "SELECT users.id, email, password, email_confirmed, COALESCE(product_id, '') as product_id, COALESCE(active, false) as active FROM users left join users_app_subscriptions on users_app_subscriptions.user_id = users.id WHERE email = $1", email)
 	if err != nil {
 		logger.Errorf("error retrieving password for user %v: %v", email, err)
 		session.AddFlash("Error: Invalid email or password!")
@@ -220,6 +225,28 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 	session.Values["authenticated"] = true
 	session.Values["user_id"] = user.ID
 	session.Values["subscription"] = user.ProductID
+
+	// save datatable state settings from anon session
+	dataTableStatePrefix := "table:state:" + utils.GetNetwork() + ":"
+
+	for k, state := range session.Values {
+		k, ok := k.(string)
+		if ok && strings.HasPrefix(k, dataTableStatePrefix) {
+			state, ok := state.(types.DataTableSaveState)
+			if ok {
+				trimK := strings.TrimPrefix(k, dataTableStatePrefix)
+				if len(trimK) > 0 {
+					err := db.SaveDataTableState(user.ID, trimK, state)
+					if err != nil {
+						logger.WithError(err).Error("error saving datatable state from session")
+					}
+				}
+			} else {
+				logger.Error("error could not parse datatable state from session, state: %+v", state)
+			}
+			delete(session.Values, k)
+		}
+	}
 	// session.AddFlash("Successfully logged in")
 
 	session.Save(r, w)
@@ -244,7 +271,7 @@ func LoginPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Index(w, r)
-	http.Redirect(w, r, "/user/notifications-center", http.StatusSeeOther)
+	http.Redirect(w, r, "/user/notifications", http.StatusSeeOther)
 }
 
 // Logout handles ending the user session.
@@ -268,6 +295,9 @@ func Logout(w http.ResponseWriter, r *http.Request) {
 // This only works if the hash in the url is correct. This will also confirm
 // the email of the user if it has not been confirmed yet.
 func ResetPassword(w http.ResponseWriter, r *http.Request) {
+
+	var resetPasswordTemplate = templates.GetTemplate("layout.html", "resetPassword.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
 	session, err := utils.SessionStore.Get(r, authSessionName)
@@ -287,7 +317,7 @@ func ResetPassword(w http.ResponseWriter, r *http.Request) {
 		ProductID      string `db:"product_id"`
 		Active         bool   `db:"active"`
 	}{}
-	err = db.FrontendDB.Get(&dbUser, "SELECT users.id, email_confirmed, email, COALESCE(product_id, '') as product_id, COALESCE(active, false) as active FROM users LEFT JOIN users_app_subscriptions on users_app_subscriptions.user_id = users.id WHERE password_reset_hash = $1", hash)
+	err = db.FrontendWriterDB.Get(&dbUser, "SELECT users.id, email_confirmed, email, COALESCE(product_id, '') as product_id, COALESCE(active, false) as active FROM users LEFT JOIN users_app_subscriptions on users_app_subscriptions.user_id = users.id WHERE password_reset_hash = $1", hash)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			session.AddFlash("Error: Invalid reset link, please retry.")
@@ -304,7 +334,7 @@ func ResetPassword(w http.ResponseWriter, r *http.Request) {
 
 	// if the user has not confirmed her email yet, just confirm it since she clicked this reset-password-link that has been sent to her email aswell anyway
 	if !dbUser.EmailConfirmed {
-		_, err = db.FrontendDB.Exec("UPDATE users SET email_confirmed = 'TRUE' WHERE id = $1", dbUser.ID)
+		_, err = db.FrontendWriterDB.Exec("UPDATE users SET email_confirmed = 'TRUE' WHERE id = $1", dbUser.ID)
 		if err != nil {
 			logger.Errorf("error setting confirmed when user is resetting password: %v", err)
 			session.AddFlash(authInternalServerErrorFlashMsg)
@@ -332,10 +362,8 @@ func ResetPassword(w http.ResponseWriter, r *http.Request) {
 	data.Data = types.AuthData{Flashes: utils.GetFlashes(w, r, authSessionName), Email: dbUser.Email, CsrfField: csrf.TemplateField(r)}
 	data.Meta.NoTrack = true
 
-	err = resetPasswordTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if handleTemplateError(w, r, resetPasswordTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -398,14 +426,16 @@ func ResetPasswordPost(w http.ResponseWriter, r *http.Request) {
 
 // RequestResetPassword renders a template that lets the user enter his email and request a reset link.
 func RequestResetPassword(w http.ResponseWriter, r *http.Request) {
+
+	var requestResetPaswordTemplate = templates.GetTemplate("layout.html", "requestResetPassword.html")
+
 	w.Header().Set("Content-Type", "text/html")
 	data := InitPageData(w, r, "register", "/register", "Reset Password")
 	data.Data = types.AuthData{Flashes: utils.GetFlashes(w, r, authSessionName), CsrfField: csrf.TemplateField(r)}
 	data.Meta.NoTrack = true
-	err := requestResetPaswordTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+
+	if handleTemplateError(w, r, requestResetPaswordTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -422,6 +452,7 @@ func RequestResetPasswordPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := r.FormValue("email")
+	email = strings.ToLower(email)
 
 	if !utils.IsValidEmail(email) {
 		utils.SetFlash(w, r, authSessionName, "Error: Invalid email address.")
@@ -430,7 +461,7 @@ func RequestResetPasswordPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var exists int
-	err = db.FrontendDB.Get(&exists, "SELECT COUNT(*) FROM users WHERE email = $1", email)
+	err = db.FrontendWriterDB.Get(&exists, "SELECT COUNT(*) FROM users WHERE email = $1", email)
 	if err != nil {
 		logger.Errorf("error retrieving user-count: %v", err)
 		utils.SetFlash(w, r, authSessionName, authInternalServerErrorFlashMsg)
@@ -460,15 +491,16 @@ func RequestResetPasswordPost(w http.ResponseWriter, r *http.Request) {
 
 // ResendConfirmation handler sends a template for the user to request another confirmation link via email.
 func ResendConfirmation(w http.ResponseWriter, r *http.Request) {
+
+	var resendConfirmationTemplate = templates.GetTemplate("layout.html", "resendConfirmation.html")
+
 	w.Header().Set("Content-Type", "text/html")
 
 	data := InitPageData(w, r, "resendConfirmation", "/resendConfirmation", "Resend Password Reset")
 	data.Data = types.AuthData{Flashes: utils.GetFlashes(w, r, authSessionName), CsrfField: csrf.TemplateField(r)}
 
-	err := resendConfirmationTemplate.ExecuteTemplate(w, "layout", data)
-	if err != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if handleTemplateError(w, r, resendConfirmationTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -483,6 +515,7 @@ func ResendConfirmationPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := r.FormValue("email")
+	email = strings.ToLower(email)
 
 	if !utils.IsValidEmail(email) {
 		utils.SetFlash(w, r, authSessionName, "Error: Invalid email!")
@@ -491,7 +524,7 @@ func ResendConfirmationPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var exists int
-	err = db.FrontendDB.Get(&exists, "SELECT COUNT(*) FROM users WHERE email = $1", email)
+	err = db.FrontendWriterDB.Get(&exists, "SELECT COUNT(*) FROM users WHERE email = $1", email)
 	if err != nil {
 		logger.Errorf("error checking if user exists for email-confirmation: %v", err)
 		utils.SetFlash(w, r, authSessionName, "Error: Something went wrong :( Please retry later")
@@ -525,7 +558,7 @@ func ConfirmEmail(w http.ResponseWriter, r *http.Request) {
 	hash := vars["hash"]
 
 	var isConfirmed = false
-	err := db.FrontendDB.Get(&isConfirmed, `
+	err := db.FrontendWriterDB.Get(&isConfirmed, `
 	SELECT email_confirmed 
 	FROM users 
 	WHERE email_confirmation_hash = $1
@@ -542,7 +575,7 @@ func ConfirmEmail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := db.FrontendDB.Exec("UPDATE users SET email_confirmed = 'TRUE' WHERE email_confirmation_hash = $1", hash)
+	res, err := db.FrontendWriterDB.Exec("UPDATE users SET email_confirmed = 'TRUE' WHERE email_confirmation_hash = $1", hash)
 	if err != nil {
 		utils.SetFlash(w, r, authSessionName, authInternalServerErrorFlashMsg)
 		http.Redirect(w, r, "/confirmation", http.StatusSeeOther)
@@ -569,7 +602,7 @@ func sendConfirmationEmail(email string) error {
 	now := time.Now()
 	emailConfirmationHash := utils.RandomString(40)
 
-	tx, err := db.FrontendDB.Beginx()
+	tx, err := db.FrontendWriterDB.Beginx()
 	if err != nil {
 		return err
 	}
@@ -581,7 +614,7 @@ func sendConfirmationEmail(email string) error {
 		return fmt.Errorf("error getting confirmation-ts: %w", err)
 	}
 	if lastTs != nil && (*lastTs).Add(authConfirmEmailRateLimit).After(now) {
-		return &types.RateLimitError{(*lastTs).Add(authConfirmEmailRateLimit).Sub(now)}
+		return &types.RateLimitError{TimeLeft: (*lastTs).Add(authConfirmEmailRateLimit).Sub(now)}
 	}
 
 	_, err = tx.Exec("UPDATE users SET email_confirmation_hash = $1 WHERE email = $2", emailConfirmationHash, email)
@@ -591,7 +624,7 @@ func sendConfirmationEmail(email string) error {
 
 	err = tx.Commit()
 	if err != nil {
-		return fmt.Errorf("error commiting db-tx: %w", err)
+		return fmt.Errorf("error committing db-tx: %w", err)
 	}
 
 	subject := fmt.Sprintf("%s: Verify your email-address", utils.Config.Frontend.SiteDomain)
@@ -603,12 +636,12 @@ Best regards,
 
 %[1]s
 `, utils.Config.Frontend.SiteDomain, emailConfirmationHash)
-	err = mail.SendMail(email, subject, msg, []types.EmailAttachment{})
+	err = mail.SendTextMail(email, subject, msg, []types.EmailAttachment{})
 	if err != nil {
 		return err
 	}
 
-	_, err = db.FrontendDB.Exec("UPDATE users SET email_confirmation_ts = TO_TIMESTAMP($1) WHERE email = $2", time.Now().Unix(), email)
+	_, err = db.FrontendWriterDB.Exec("UPDATE users SET email_confirmation_ts = TO_TIMESTAMP($1) WHERE email = $2", time.Now().Unix(), email)
 	if err != nil {
 		return fmt.Errorf("error updating confirmation-ts: %w", err)
 	}
@@ -620,7 +653,7 @@ func sendResetEmail(email string) error {
 	now := time.Now()
 	resetHash := utils.RandomString(40)
 
-	tx, err := db.FrontendDB.Beginx()
+	tx, err := db.FrontendWriterDB.Beginx()
 	if err != nil {
 		return err
 	}
@@ -632,7 +665,7 @@ func sendResetEmail(email string) error {
 		return fmt.Errorf("error getting reset-ts: %w", err)
 	}
 	if lastTs != nil && (*lastTs).Add(authResetEmailRateLimit).After(now) {
-		return &types.RateLimitError{(*lastTs).Add(authResetEmailRateLimit).Sub(now)}
+		return &types.RateLimitError{TimeLeft: (*lastTs).Add(authResetEmailRateLimit).Sub(now)}
 	}
 
 	_, err = tx.Exec("UPDATE users SET password_reset_hash = $1 WHERE email = $2", resetHash, email)
@@ -642,7 +675,7 @@ func sendResetEmail(email string) error {
 
 	err = tx.Commit()
 	if err != nil {
-		return fmt.Errorf("error commiting db-tx: %w", err)
+		return fmt.Errorf("error committing db-tx: %w", err)
 	}
 
 	subject := fmt.Sprintf("%s: Reset your password", utils.Config.Frontend.SiteDomain)
@@ -654,12 +687,12 @@ Best regards,
 
 %[1]s
 `, utils.Config.Frontend.SiteDomain, resetHash)
-	err = mail.SendMail(email, subject, msg, []types.EmailAttachment{})
+	err = mail.SendTextMail(email, subject, msg, []types.EmailAttachment{})
 	if err != nil {
 		return err
 	}
 
-	_, err = db.FrontendDB.Exec("UPDATE users SET password_reset_ts = TO_TIMESTAMP($1) WHERE email = $2", time.Now().Unix(), email)
+	_, err = db.FrontendWriterDB.Exec("UPDATE users SET password_reset_ts = TO_TIMESTAMP($1) WHERE email = $2", time.Now().Unix(), email)
 	if err != nil {
 		return fmt.Errorf("error updating reset-ts: %w", err)
 	}

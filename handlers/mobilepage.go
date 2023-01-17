@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"eth2-exporter/mail"
+	"eth2-exporter/templates"
 	"eth2-exporter/types"
 	"eth2-exporter/utils"
 	"fmt"
@@ -9,9 +10,9 @@ import (
 	"net/http"
 )
 
-var mobileTemplate = template.Must(template.New("mobilepage").Funcs(utils.GetTemplateFuncs()).ParseFiles("templates/layout.html", "templates/mobilepage.html"))
-
 func MobilePage(w http.ResponseWriter, r *http.Request) {
+	var mobileTemplate = templates.GetTemplate("layout.html", "mobilepage.html")
+
 	var err error
 	w.Header().Set("Content-Type", "text/html")
 
@@ -22,17 +23,14 @@ func MobilePage(w http.ResponseWriter, r *http.Request) {
 	pageData.FlashMessage, err = utils.GetFlash(w, r, "ad_flash")
 	if err != nil {
 		logger.Errorf("error retrieving flashes for mobile page %v", err)
-		http.Error(w, "Internal server error", 503)
+		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
 		return
 	}
 	data.Data = pageData
 	data.HeaderAd = true
 
-	err2 := mobileTemplate.ExecuteTemplate(w, "layout", data)
-	if err2 != nil {
-		logger.Errorf("error executing template for %v route: %v", r.URL.String(), err2)
-		http.Error(w, "Internal server error", 503)
-		return
+	if handleTemplateError(w, r, mobileTemplate.ExecuteTemplate(w, "layout", data)) != nil {
+		return // an error has occurred and was processed
 	}
 }
 
@@ -78,7 +76,7 @@ func MobilePagePost(w http.ResponseWriter, r *http.Request) {
 	// escape html
 	msg = template.HTMLEscapeString(msg)
 
-	err = mail.SendMail("support@beaconcha.in", "New app pool support inquiry", msg, []types.EmailAttachment{})
+	err = mail.SendTextMail("support@beaconcha.in", "New app pool support inquiry", msg, []types.EmailAttachment{})
 	if err != nil {
 		logger.Errorf("error sending app pool form: %v", err)
 		utils.SetFlash(w, r, "ad_flash", "Error: unable to submit app pool request")
